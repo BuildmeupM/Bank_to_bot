@@ -1,0 +1,6 @@
+[server]
+runOnSave = true
+headless = false
+
+[runner]
+fastReruns = true
