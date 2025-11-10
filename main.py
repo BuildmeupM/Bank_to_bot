@@ -12,15 +12,22 @@ import pdfplumber
 from datetime import datetime
 import io
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import os
 import sys
 import importlib.util
+import importlib.machinery
+import importlib
 import time
 import logging
 import asyncio
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from NewPeak import NewPeakBot
+except ImportError:
+    NewPeakBot = None
 
 # ตั้งค่า logging ก่อน (เพื่อใช้ logger ในการตรวจสอบ config)
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +51,7 @@ except ImportError:
 
 # เก็บ bot instances ไว้ใน module level เพื่อป้องกัน garbage collection
 _peakengine_bots = []
+_newpeak_bots = []
 
 # แก้ปัญหา asyncio event loop บน Windows ให้รองรับ subprocess (Playwright)
 if sys.platform.startswith("win"):
@@ -487,6 +495,96 @@ def open_peakengine_login() -> bool:
         st.error(f"❌ ไม่สามารถเปิดหน้าเว็บ PeakEngine ได้: {e}")
         logger.error(f"Error details: {e}", exc_info=True)
     return False
+
+
+def open_newpeak_login() -> bool:
+    """เปิดหน้าเว็บ PEAK Account (ระบบใหม่) และทดสอบการ Login ด้วย NewPeakBot"""
+    if NewPeakBot is None:
+        st.error("❌ ไม่พบคลาส NewPeakBot (ตรวจสอบว่าไฟล์ NewPeak.py อยู่ในโฟลเดอร์เดียวกัน)")
+        logger.error("NewPeakBot ไม่พร้อมใช้งาน - ไม่พบโมดูล NewPeak")
+        return False
+
+    if config is None:
+        st.error("❌ ไม่พบไฟล์ config.py สำหรับกำหนดการเข้าสู่ระบบ NewPeak")
+        return False
+
+    username = getattr(config, "NEWPEAK_USERNAME", "")
+    if not username:
+        username = getattr(config, "PEAKENGINE_USERNAME", "")
+    password = getattr(config, "NEWPEAK_PASSWORD", "")
+    if not password:
+        password = getattr(config, "PEAKENGINE_PASSWORD", "")
+    headless = getattr(config, "HEADLESS_MODE", False)
+
+    if not username or not password:
+        st.warning("⚠️ กรุณากำหนด NEWPEAK_USERNAME / NEWPEAK_PASSWORD (หรือ PEAKENGINE_USERNAME / PEAKENGINE_PASSWORD) ใน config.py")
+        return False
+
+    def run_bot():
+        bot = None
+        try:
+            bot = NewPeakBot(use_browser=True, headless=headless)
+            _newpeak_bots.append(bot)
+            logger.info(f"🆕 เก็บ NewPeakBot instance (ทั้งหมด {len(_newpeak_bots)} ตัว)")
+
+            def log_callback(message: str, status: str = "info"):
+                log_func = {
+                    "info": logger.info,
+                    "success": logger.info,
+                    "warning": logger.warning,
+                    "error": logger.error,
+                }.get(status, logger.info)
+                log_func(f"[NewPeakBot] {message}")
+
+            login_success = bot.login(
+                username,
+                password,
+                navigate_after_login=True,
+                log_callback=log_callback,
+            )
+
+            if login_success:
+                logger.info("✅ NewPeakBot Login สำเร็จ สามารถใช้งาน Browser ต่อได้")
+            else:
+                logger.warning("⚠️ NewPeakBot Login ไม่สำเร็จ กรุณาตรวจสอบ log และข้อมูลใน config.py")
+        except Exception as exc:
+            logger.error(f"❌ เกิดข้อผิดพลาดใน NewPeakBot: {exc}", exc_info=True)
+            if bot and bot._executor:  # type: ignore[attr-defined]
+                try:
+                    bot.close()
+                except Exception:
+                    pass
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    executor.submit(run_bot)
+    return True
+
+
+def wait_for_newpeak_login(bot, timeout: float = 60.0, poll_interval: float = 0.5, log_callback=None) -> bool:
+    """รอให้ NewPeakBot login เสร็จก่อนเริ่มประมวลผล"""
+    start = time.time()
+    while time.time() - start < timeout:
+        if getattr(bot, "is_logged_in", False):
+            return True
+        time.sleep(poll_interval)
+    if log_callback:
+        try:
+            log_callback("⚠️ รอเข้าสู่ระบบ New Peak เกินเวลาที่กำหนด", "warning")
+        except Exception:
+            pass
+    return getattr(bot, "is_logged_in", False)
+
+
+def wait_for_newpeak_instance(timeout: float = 30.0, poll_interval: float = 0.5):
+    """รอให้มีการสร้างอินสแตนซ์ NewPeakBot (จาก thread อื่น)"""
+    start = time.time()
+    while time.time() - start < timeout:
+        if _newpeak_bots:
+            bot = _newpeak_bots[-1]
+            if bot:
+                return bot
+        time.sleep(poll_interval)
+    return _newpeak_bots[-1] if _newpeak_bots else None
 
 class BankPDFReader:
     """คลาสสำหรับอ่านไฟล์ PDF ของธนาคารต่างๆ"""
@@ -1170,6 +1268,53 @@ def process_pdf_file(uploaded_file, reader, selected_bank):
             
             # แปลงรูปแบบวันที่เป็น dd/MM/yyyy
             df = reader.format_date_column(df)
+
+            def parse_amount_value(amount_str):
+                if amount_str is None or (isinstance(amount_str, float) and pd.isna(amount_str)):
+                    return None
+                text_amount = str(amount_str).strip()
+                if not text_amount:
+                    return None
+                negative = False
+                if text_amount.startswith('(') and text_amount.endswith(')'):
+                    negative = True
+                    text_amount = text_amount[1:-1]
+                text_amount = text_amount.replace(',', '').replace('+', '').strip()
+                try:
+                    value = float(text_amount)
+                    return -value if negative else value
+                except ValueError:
+                    return None
+
+            if not df.empty and 'จำนวนเงิน' in df.columns:
+                df['ยอดเงิน_numeric'] = df['จำนวนเงิน'].apply(parse_amount_value)
+            else:
+                df['ยอดเงิน_numeric'] = pd.Series(dtype=float)
+
+            if not df.empty and 'คำอธิบาย' in df.columns:
+                df['ประเภทผู้ส่งโอน'] = df['คำอธิบาย'].apply(reader.classify_transfer_type)
+                st.subheader("🏷️ ประเภทผู้ส่งโอนที่พบ")
+                category_counts = df['ประเภทผู้ส่งโอน'].value_counts()
+                category_summary = pd.DataFrame({
+                    'ประเภทผู้ส่งโอน': category_counts.index,
+                    'จำนวนรายการ': category_counts.values
+                })
+                st.dataframe(category_summary, use_container_width=True, hide_index=True)
+
+            if not df.empty and 'ยอดเงิน_numeric' in df.columns:
+                income_df = df[df['ยอดเงิน_numeric'] > 0]
+                expense_df = df[df['ยอดเงิน_numeric'] < 0]
+                st.subheader("💰 สรุปเงินเข้า/เงินออก")
+                col_in, col_out, col_net = st.columns(3)
+                with col_in:
+                    st.metric("เงินเข้า (Income)", f"{income_df['ยอดเงิน_numeric'].sum():,.2f}", help="ผลรวมยอดเงินที่เป็นบวก")
+                    st.caption(f"รายการเงินเข้า: {len(income_df)}")
+                with col_out:
+                    st.metric("เงินออก (Expense)", f"{expense_df['ยอดเงิน_numeric'].sum():,.2f}", help="ผลรวมยอดเงินที่เป็นลบ")
+                    st.caption(f"รายการเงินออก: {len(expense_df)}")
+                with col_net:
+                    net_amount = df['ยอดเงิน_numeric'].sum()
+                    st.metric("ยอดสุทธิ", f"{net_amount:,.2f}", help="ยอดเงินเข้า - เงินออก")
             
             if not df.empty:
                 st.success("✅ ประมวลผลสำเร็จ!")
@@ -1185,6 +1330,8 @@ def process_pdf_file(uploaded_file, reader, selected_bank):
                 display_columns = ['วันที่', 'รายการ', 'จำนวนเงิน', 'ยอดคงเหลือ']
                 if 'คำอธิบาย' in df.columns:
                     display_columns.append('คำอธิบาย')
+                if 'ประเภทผู้ส่งโอน' in df.columns:
+                    display_columns.append('ประเภทผู้ส่งโอน')
                 
                 # เพิ่มคอลัมน์ชื่อบริษัท/บุคคลถ้ามีคำอธิบาย
                 if 'คำอธิบาย' in df.columns:
@@ -1227,28 +1374,10 @@ def process_pdf_file(uploaded_file, reader, selected_bank):
                     st.metric("วันที่สิ้นสุด", df['วันที่'].max() if 'วันที่' in df.columns else "N/A")
                 with col4:
                     # คำนวณยอดรวมและแยกรายการเพิ่ม/ลด
-                    if 'จำนวนเงิน' in df.columns:
-                        total_amount = 0
-                        positive_count = 0
-                        negative_count = 0
-                        
-                        for amount in df['จำนวนเงิน']:
-                            if amount and amount != "":
-                                try:
-                                    # แปลงจำนวนเงินเป็นตัวเลข
-                                    clean_amount = amount.replace(',', '').replace('(', '').replace(')', '')
-                                    amount_value = float(clean_amount)
-                                    
-                                    if '(' in amount and ')' in amount:
-                                        # รายการติดลบ
-                                        total_amount -= amount_value
-                                        negative_count += 1
-                                    else:
-                                        # รายการบวก
-                                        total_amount += amount_value
-                                        positive_count += 1
-                                except:
-                                    pass
+                    if 'ยอดเงิน_numeric' in df.columns and not df['ยอดเงิน_numeric'].isna().all():
+                        total_amount = df['ยอดเงิน_numeric'].sum()
+                        positive_count = int((df['ยอดเงิน_numeric'] > 0).sum())
+                        negative_count = int((df['ยอดเงิน_numeric'] < 0).sum())
                         
                         st.metric("ยอดรวม", f"{total_amount:,.2f}")
                         
@@ -1377,10 +1506,16 @@ def process_pdf_file(uploaded_file, reader, selected_bank):
                                             ["ทั้งหมด", "รายการเพิ่ม", "รายการลด"],
                                             key=f"amount_filter_{transfer_type}"
                                         )
-                                        if amount_filter == "รายการเพิ่ม":
-                                            type_data = type_data[type_data['จำนวนเงิน'].str.contains(r'^\d', na=False)]
-                                        elif amount_filter == "รายการลด":
-                                            type_data = type_data[type_data['จำนวนเงิน'].str.contains(r'^\(', na=False)]
+                                        if 'ยอดเงิน_numeric' in type_data.columns:
+                                            if amount_filter == "รายการเพิ่ม":
+                                                type_data = type_data[type_data['ยอดเงิน_numeric'] > 0]
+                                            elif amount_filter == "รายการลด":
+                                                type_data = type_data[type_data['ยอดเงิน_numeric'] < 0]
+                                        else:
+                                            if amount_filter == "รายการเพิ่ม":
+                                                type_data = type_data[type_data['จำนวนเงิน'].str.contains(r'^\d', na=False)]
+                                            elif amount_filter == "รายการลด":
+                                                type_data = type_data[type_data['จำนวนเงิน'].str.contains(r'^\(', na=False)]
                                     
                                     # เลือกคอลัมน์ที่ต้องการแสดง
                                     display_columns = ['วันที่', 'รายการ', 'จำนวนเงิน', 'ยอดคงเหลือ']
@@ -1434,8 +1569,12 @@ def process_pdf_file(uploaded_file, reader, selected_bank):
                                     st.write("**สรุปย่อย:**")
                                     
                                     # คำนวณสถิติเพิ่มเติม
-                                    positive_count = len(type_data[type_data['จำนวนเงิน'].str.contains(r'^\d', na=False)])
-                                    negative_count = len(type_data[type_data['จำนวนเงิน'].str.contains(r'^\(', na=False)])
+                                    if 'ยอดเงิน_numeric' in type_data.columns:
+                                        positive_count = int((type_data['ยอดเงิน_numeric'] > 0).sum())
+                                        negative_count = int((type_data['ยอดเงิน_numeric'] < 0).sum())
+                                    else:
+                                        positive_count = len(type_data[type_data['จำนวนเงิน'].str.contains(r'^\d', na=False)])
+                                        negative_count = len(type_data[type_data['จำนวนเงิน'].str.contains(r'^\(', na=False)])
                                     
                                     col1, col2, col3, col4 = st.columns(4)
                                     with col1:
@@ -1457,8 +1596,8 @@ def process_pdf_file(uploaded_file, reader, selected_bank):
                     st.subheader("📊 สรุปข้อมูลตามทิศทาง")
                     
                     # แยกข้อมูลตามทิศทาง
-                    positive_transactions = df[df['จำนวนเงิน'].str.contains(r'^\d', na=False)]
-                    negative_transactions = df[df['จำนวนเงิน'].str.contains(r'^\(', na=False)]
+                    positive_transactions = df[df['ยอดเงิน_numeric'] > 0] if 'ยอดเงิน_numeric' in df.columns else pd.DataFrame()
+                    negative_transactions = df[df['ยอดเงิน_numeric'] < 0] if 'ยอดเงิน_numeric' in df.columns else pd.DataFrame()
                     
                     col1, col2 = st.columns(2)
                     
@@ -2213,34 +2352,715 @@ def render_receipt_bot_page():
     st.header("🧾 Bot รันเปิดใบเสร็จ")
     st.markdown("---")
     st.write("**ระบบกรอกข้อมูลใบเสร็จอัตโนมัติ**")
-    
-    st.info("🚧 **ระบบนี้กำลังอยู่ในขั้นตอนการพัฒนา**")
-    
-    # แสดงปุ่มต่างๆ ที่จะใช้ในอนาคต
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.button("📝 กรอกข้อมูลใบเสร็จ", disabled=True, use_container_width=True, help="ฟีเจอร์นี้จะเปิดใช้งานในอนาคต")
-    
-    with col2:
-        st.button("📤 อัปโหลดไฟล์", disabled=True, use_container_width=True, help="ฟีเจอร์นี้จะเปิดใช้งานในอนาคต")
-    
-    with col3:
-        st.button("⚙️ ตั้งค่าระบบ", disabled=True, use_container_width=True, help="ฟีเจอร์นี้จะเปิดใช้งานในอนาคต")
-    
-    st.markdown("---")
-    st.subheader("📋 ฟีเจอร์ที่จะมีในอนาคต")
-    
-    features = [
-        "✅ กรอกข้อมูลใบเสร็จอัตโนมัติ",
-        "✅ อัปโหลดไฟล์ Excel/CSV",
-        "✅ ตรวจสอบข้อมูลก่อนบันทึก",
-        "✅ ส่งข้อมูลไปยังระบบ",
-        "✅ รายงานผลการทำงาน"
-    ]
-    
-    for feature in features:
-        st.write(f"• {feature}")
+    st.info("🎯 ขั้นตอนที่ 1: นำเข้าไฟล์ Excel ที่มีข้อมูลจาก DBD เพื่อเตรียมใช้กรอกในระบบ PEAKEngine")
+
+    uploaded_peak_excel = st.file_uploader(
+        "📁 เลือกไฟล์ Excel ที่มีชีต 'ข้อมูลพร้อม DBD'",
+        type=['xlsx', 'xls'],
+        help="ไฟล์จะถูกประมวลผลจากชีต 'ข้อมูลพร้อม DBD' และ 'สรุปข้อมูล DBD' เพื่อแสดงรายละเอียดก่อนนำไปใช้งาน"
+    )
+
+    def normalize_registration_number(reg_value):
+        if pd.isna(reg_value):
+            return ""
+        reg_str = str(reg_value).strip()
+        if not reg_str:
+            return ""
+        digits = "".join(ch for ch in reg_str if ch.isdigit())
+        if not digits:
+            return ""
+        digits = digits[-13:]
+        if len(digits) < 13:
+            digits = digits.zfill(13)
+        if digits[0] != "0":
+            digits = "0" + digits[1:]
+        return digits
+
+    def parse_dbd_info(text: str) -> Dict[str, str]:
+        results = {}
+        if not text or pd.isna(text):
+            return results
+        parts = [part.strip() for part in str(text).split('|')]
+        for part in parts:
+            if ':' not in part:
+                continue
+            key, value = part.split(':', 1)
+            results[key.strip()] = value.strip()
+        return results
+
+    if uploaded_peak_excel is not None:
+        with st.spinner("กำลังตรวจสอบไฟล์ Excel..."):
+            try:
+                excel_file = pd.ExcelFile(uploaded_peak_excel)
+                if "ข้อมูลพร้อม DBD" not in excel_file.sheet_names:
+                    available_sheets = ", ".join(excel_file.sheet_names)
+                    st.error("❌ ไม่พบชีต 'ข้อมูลพร้อม DBD' ในไฟล์ที่อัปโหลด")
+                    if available_sheets:
+                        st.info(f"📄 ชีตที่พบ: {available_sheets}")
+                else:
+                    df_peak = pd.read_excel(excel_file, sheet_name="ข้อมูลพร้อม DBD")
+                    st.success("✅ โหลดข้อมูลจากชีต 'ข้อมูลพร้อม DBD' สำเร็จ!")
+
+                    # เก็บข้อมูลไว้ใน session state สำหรับขั้นตอนถัดไป
+                    st.session_state["peakengine_source_df"] = df_peak
+                    st.session_state["peakengine_source_filename"] = getattr(uploaded_peak_excel, "name", "uploaded.xlsx")
+
+                    st.subheader("📊 สรุปข้อมูลจากไฟล์")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("จำนวนแถวทั้งหมด", len(df_peak))
+                    with col2:
+                        st.metric("จำนวนคอลัมน์", len(df_peak.columns))
+                    with col3:
+                        available_company_cols = [col for col in df_peak.columns if "ชื่อบริษัท" in str(col)]
+                        st.metric("คอลัมน์ชื่อบริษัทที่พบ", len(available_company_cols))
+
+                    st.write("**คอลัมน์ทั้งหมดในชีต:**")
+                    st.write(", ".join(df_peak.columns.astype(str).tolist()) or "-")
+
+                    st.subheader("🔍 ตัวอย่างข้อมูล (5 แถวแรก)")
+                    st.dataframe(df_peak.head(5), use_container_width=True)
+
+                    if available_company_cols:
+                        st.caption(f"🎯 จะใช้คอลัมน์เหล่านี้ในการกรอกข้อมูล: {', '.join(available_company_cols)}")
+                    else:
+                        st.warning("⚠️ ไม่พบคอลัมน์ที่มีคำว่า 'ชื่อบริษัท' ภายในหัวคอลัมน์ โปรดตรวจสอบไฟล์")
+
+                    reg_info_map: Dict[str, Dict[str, Any]] = {}
+                    for idx_row, row in df_peak.iterrows():
+                        dbd_raw = row.get("ข้อมูล DBD", "")
+                        dbd_parsed = parse_dbd_info(dbd_raw)
+                        reg_candidate = (
+                            row.get("เลขทะเบียน")
+                            or row.get("เลขทะเบียนจาก DBD")
+                            or row.get("เลขทะเบียนนิติบุคคล")
+                            or dbd_parsed.get("เลขทะเบียน")
+                        )
+                        reg_normalized = normalize_registration_number(reg_candidate)
+                        if not reg_normalized:
+                            continue
+                        row_dict = row.to_dict()
+                        reg_info_map[reg_normalized] = {
+                            "registration": reg_normalized,
+                            "dbd_raw": dbd_raw,
+                            "dbd_info": dbd_parsed,
+                            "transfer_type": str(row.get("ประเภทผู้ส่งโอน", "")).strip(),
+                            "company_name": row.get("ชื่อบริษัทจาก DBD", ""),
+                            "row_index": int(idx_row),
+                            "row": row_dict
+                        }
+                    st.session_state["peakengine_reg_info_map"] = reg_info_map
+
+                    if "สรุปข้อมูล DBD" in excel_file.sheet_names:
+                        df_summary = pd.read_excel(excel_file, sheet_name="สรุปข้อมูล DBD")
+
+                        if "เลขทะเบียน" in df_summary.columns:
+                            df_summary["เลขทะเบียน_พร้อมใช้งาน"] = df_summary["เลขทะเบียน"].apply(normalize_registration_number)
+                        else:
+                            df_summary["เลขทะเบียน_พร้อมใช้งาน"] = ""
+
+                        st.session_state["peakengine_summary_df"] = df_summary
+                        st.subheader("📑 สรุปข้อมูล DBD")
+
+                        reg_series = df_summary.get("เลขทะเบียน_พร้อมใช้งาน", df_summary.get("เลขทะเบียน"))
+                        valid_reg = []
+                        if reg_series is not None:
+                            reg_series = reg_series.astype(str).str.strip()
+                            valid_reg = [reg for reg in reg_series if reg and reg.lower() != "nan"]
+
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("จำนวนแถว (สรุป)", len(df_summary))
+                        with col2:
+                            st.metric("จำนวนเลขทะเบียนที่ไม่ว่าง", len(valid_reg))
+                        with col3:
+                            unique_regs = list(dict.fromkeys(valid_reg))
+                            st.metric("เลขทะเบียนไม่ซ้ำ", len(unique_regs))
+
+                        st.write("**คอลัมน์ใน 'สรุปข้อมูล DBD':**")
+                        st.write(", ".join(df_summary.columns.astype(str).tolist()) or "-")
+
+                        st.subheader("🔍 ตัวอย่างจาก 'สรุปข้อมูล DBD' (5 แถวแรก)")
+                        st.dataframe(df_summary.head(5), use_container_width=True)
+                    else:
+                        st.warning("⚠️ ไม่พบชีต 'สรุปข้อมูล DBD' ในไฟล์นี้ ระบบจะไม่สามารถเตรียมเลขทะเบียนสำหรับกรอกผู้ติดต่อได้")
+
+            except Exception as e:
+                st.error(f"❌ เกิดข้อผิดพลาดในการอ่านไฟล์ Excel: {str(e)}")
+    else:
+        st.info("📥 กรุณาอัปโหลดไฟล์ Excel เพื่อเริ่มตั้งค่าขั้นตอนการกรอกข้อมูล")
+
+    summary_df = st.session_state.get("peakengine_summary_df")
+    if summary_df is not None and not summary_df.empty:
+        st.markdown("---")
+        st.subheader("🧾 ขั้นตอนที่ 2: เตรียมกรอกเลขทะเบียนใน PEAKEngine")
+
+        reg_series = summary_df.get("เลขทะเบียน_พร้อมใช้งาน", summary_df.get("เลขทะเบียน"))
+        if reg_series is None:
+            st.warning("⚠️ ไม่พบคอลัมน์ 'เลขทะเบียน' ในชีต 'สรุปข้อมูล DBD'")
+            return
+
+        reg_series = reg_series.astype(str).str.strip()
+        registration_numbers = [reg for reg in reg_series if reg and reg.lower() != "nan"]
+        unique_registration_numbers = list(dict.fromkeys(registration_numbers))
+
+        if not registration_numbers:
+            st.warning("⚠️ ไม่มีเลขทะเบียนที่พร้อมสำหรับกรอก")
+            return
+
+        processed_list = st.session_state.get("peakengine_processed_regs", [])
+        processed_set = set(processed_list)
+        pending_numbers = [reg for reg in registration_numbers for _ in [reg] if reg not in processed_set]
+        pending_unique_numbers = [reg for reg in unique_registration_numbers if reg not in processed_set]
+
+        st.write(f"📌 พบเลขทะเบียนทั้งหมด {len(registration_numbers)} รายการ (ไม่ซ้ำ {len(unique_registration_numbers)})")
+
+        col_stats1, col_stats2, col_stats3 = st.columns(3)
+        with col_stats1:
+            st.metric("รายการที่กรอกแล้ว", len(processed_set))
+        with col_stats2:
+            st.metric("รายการที่เหลือ", len(pending_numbers))
+        with col_stats3:
+            st.metric("เลขทะเบียนที่เหลือ (ไม่ซ้ำ)", len(pending_unique_numbers))
+
+        st.caption("เลือกโหมดการทำงาน: กรอกทีละรายการ หรือกรอกต่อเนื่องทุกเลขที่เหลือ")
+
+        fill_mode = st.radio(
+            "โหมดการกรอก:",
+            ["กรอกทีละรายการ", "กรอกต่อเนื่อง (ทั้งหมดที่เหลือ)"],
+            key="peak_fill_mode",
+            horizontal=True
+        )
+
+        selected_registration = None
+        if fill_mode == "กรอกทีละรายการ":
+            selected_registration = st.selectbox(
+                "เลือกเลขทะเบียนที่จะกรอก:",
+                pending_numbers if pending_numbers else registration_numbers,
+                index=0 if pending_numbers or registration_numbers else None,
+                key="selected_registration_number"
+            )
+
+            if not selected_registration:
+                st.warning("⚠️ ไม่พบเลขทะเบียนที่พร้อมสำหรับกรอก")
+                return
+        else:
+            # รีเซ็ตค่าเลือกเมื่อเปลี่ยนโหมด
+            st.session_state["selected_registration_number"] = ""
+
+        if st.button("♻️ รีเซ็ตสถานะรายการที่กรอกแล้ว", key="reset_peak_processed"):
+            st.session_state["peakengine_processed_regs"] = []
+            st.success("รีเซ็ตสถานะเรียบร้อยแล้ว")
+            st.experimental_rerun()
+
+        log_expander = st.expander("📋 Log การทำงาน", expanded=False)
+        log_placeholder = log_expander.empty()
+        log_messages: List[Dict[str, str]] = []
+
+        def peak_log(message: str, status: str = "info"):
+            icon_map = {
+                "info": "ℹ️",
+                "success": "✅",
+                "warning": "⚠️",
+                "error": "❌"
+            }
+            log_messages.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "status": status,
+                "message": message
+            })
+            lines = []
+            for entry in log_messages[-200:]:
+                icon = icon_map.get(entry["status"], "📝")
+                lines.append(f"[{entry['time']}] {icon} {entry['message']}")
+            log_placeholder.code("\n".join(lines), language=None)
+
+        col_fill_peak, col_newpeak = st.columns(2)
+        with col_fill_peak:
+            if st.button("📝 เริ่มกรอกเลขทะเบียนลงหน้าเว็บ PEAK", type="primary", key="fill_peak_contacts_btn"):
+                if config is None:
+                    st.error("❌ ไม่พบไฟล์ config.py ไม่สามารถเข้าสู่ระบบ PEAKEngine ได้")
+                    return
+
+                username = getattr(config, 'PEAKENGINE_USERNAME', '')
+                password = getattr(config, 'PEAKENGINE_PASSWORD', '')
+                link_company = getattr(config, 'Link_conpany', None)
+                link_receipt = getattr(config, 'Link_receipt', None)
+                headless = getattr(config, 'HEADLESS_MODE', False)
+
+                if not username or not password:
+                    st.error("❌ กรุณากำหนด PEAKENGINE_USERNAME และ PEAKENGINE_PASSWORD ใน config.py ก่อน")
+                    return
+
+                with st.spinner("กำลังเปิดเบราว์เซอร์และเข้าสู่ระบบ..."):
+                    try:
+                        from peakengine_bot import PeakEngineBot
+                        bot = PeakEngineBot(use_browser=True, headless=headless)
+                        _peakengine_bots.append(bot)
+
+                        peak_log("🚀 เริ่มเข้าสู่ระบบ PEAKEngine...", "info")
+                        login_success = bot.login(username, password, link_company=link_company, link_receipt=link_receipt, log_callback=peak_log)
+
+                        if not login_success:
+                            st.error("❌ เข้าสู่ระบบ PEAKEngine ไม่สำเร็จ กรุณาตรวจสอบข้อมูลใน config.py")
+                            return
+
+                        peak_log("✅ เข้าสู่ระบบเรียบร้อย เตรียมกรอกเลขทะเบียน", "success")
+
+                        if fill_mode == "กรอกทีละรายการ":
+                            fill_targets = [selected_registration]
+                        else:
+                            if not pending_unique_numbers:
+                                st.warning("⚠️ ไม่มีเลขทะเบียนที่เหลือสำหรับกรอก")
+                                return
+                            fill_targets = pending_unique_numbers
+                            st.info(f"🔁 จะกรอกเลขทะเบียนทั้งหมด {len(fill_targets)} รายการที่ยังไม่ได้ทำ")
+
+                        reg_info_map = st.session_state.get("peakengine_reg_info_map", {})
+                        fill_result = bot.fill_contact_fields(
+                            fill_targets,
+                            reg_info_map=reg_info_map,
+                            log_callback=peak_log
+                        )
+
+                        if "error" in fill_result:
+                            st.error(f"❌ ไม่สามารถกรอกข้อมูลได้: {fill_result['error']}")
+                        else:
+                            success_count = fill_result.get("success", 0)
+                            total_count = fill_result.get("total", len(fill_targets))
+                            error_list = fill_result.get("errors", [])
+                            processed_values = fill_result.get("processed", [])
+
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("จำนวนที่ต้องกรอก", total_count)
+                            with col2:
+                                st.metric("กรอกสำเร็จ", success_count)
+                            with col3:
+                                st.metric("ไม่สำเร็จ", len(error_list))
+
+                            if processed_values:
+                                processed_set.update(processed_values)
+                                st.session_state["peakengine_processed_regs"] = list(processed_set)
+
+                            if error_list:
+                                st.warning("⚠️ มีบางรายการกรอกไม่สำเร็จ ดูรายละเอียดด้านล่าง")
+                                df_errors = pd.DataFrame(error_list)
+                                st.dataframe(df_errors, use_container_width=True)
+                            else:
+                                if fill_mode == "กรอกทีละรายการ":
+                                    st.success("🎉 กรอกเลขทะเบียนเสร็จสิ้น")
+                                else:
+                                    st.success("🎉 กรอกเลขทะเบียนที่เหลือทั้งหมดเรียบร้อย")
+
+                            dropdown_data = fill_result.get("dropdown_options", [])
+                            if dropdown_data:
+                                st.subheader("📋 ผลการตรวจสอบ Dropdown หลังกรอก")
+                                for entry in dropdown_data:
+                                    value = entry.get("value", "")
+                                    items = entry.get("items", [])
+                                    st.write(f"**เลขทะเบียน:** {value}")
+                                    if items:
+                                        st.write(f"ตัวเลือก ({len(items)}):")
+                                        st.code("\n".join(items), language=None)
+                                    else:
+                                        st.write("ไม่มีตัวเลือกแสดงใน dropdown")
+
+                            plus_clicks = fill_result.get("plus_clicked", [])
+                            if plus_clicks:
+                                st.info(f"🔄 มีการคลิก '+ เพิ่มผู้ติดต่อ' สำหรับเลขทะเบียน: {', '.join(plus_clicks)}")
+                            elif dropdown_data:
+                                st.info("ℹ️ ไม่มีการคลิก '+ เพิ่มผู้ติดต่อ' เนื่องจากพบตัวเลือกอื่นใน dropdown")
+
+                            selected_existing = fill_result.get("selected_existing", [])
+                            if selected_existing:
+                                st.success(f"✅ ระบบเลือกผู้ติดต่อที่มีอยู่แล้วสำหรับเลขทะเบียน: {', '.join(selected_existing)}")
+
+                            validation_results = fill_result.get("validation", [])
+                            if validation_results:
+                                st.subheader("🔍 ผลการตรวจสอบข้อมูลกับ Excel")
+                                for validation in validation_results:
+                                    reg = validation.get("registration", "")
+                                    st.write(f"**เลขทะเบียน:** {reg}")
+                                    overall = validation.get("overall_match", False)
+                                    if overall:
+                                        st.success("ข้อมูลที่ค้นหามาตรงกับข้อมูลใน Excel ทุกช่องที่ตรวจสอบ")
+                                    else:
+                                        st.warning("พบข้อมูลบางช่องไม่ตรงกับ Excel ดูรายละเอียดด้านล่าง")
+                                    details = validation.get("details", [])
+                                    mismatch_rows = []
+                                    for detail in details:
+                                        field = detail.get("field", "")
+                                        expected = detail.get("expected", "")
+                                        actual = detail.get("actual", "")
+                                        match = detail.get("match", False)
+                                        status_symbol = "✅" if match else "⚠️"
+                                        mismatch_rows.append(f"{status_symbol} {field}\n  - Excel: {expected}\n  - ระบบ: {actual}")
+                                    st.code("\n".join(mismatch_rows), language=None)
+
+                    except Exception as e:
+                        st.error(f"❌ เกิดข้อผิดพลาดระหว่างกรอกข้อมูล: {str(e)}")
+                        peak_log(f"❌ เกิดข้อผิดพลาด: {str(e)}", "error")
+
+        with col_newpeak:
+            if st.button("🆕 เปิดระบบ New Peak (ทดลอง)", key="open_newpeak_from_excel"):
+                with st.spinner("กำลังเปิดเบราว์เซอร์ New Peak..."):
+                    if open_newpeak_login():
+                        st.success("✅ สั่งเปิด Browser สำหรับระบบ New Peak เรียบร้อยแล้ว")
+                        st.info("👀 ตรวจสอบหน้าต่างเบราว์เซอร์ใหม่เพื่อดูการทำงานของบอท New Peak")
+                        with st.spinner("⏳ กำลังตรวจสอบอินสแตนซ์ NewPeakBot..."):
+                            newpeak_bot_instance = wait_for_newpeak_instance(timeout=45, poll_interval=0.5)
+                            if newpeak_bot_instance and isinstance(newpeak_bot_instance, NewPeakBot):
+                                st.session_state["active_newpeak_bot"] = newpeak_bot_instance
+                                peak_log("✅ พบอินสแตนซ์ NewPeakBot พร้อมใช้งาน", "success")
+                            else:
+                                st.warning("⚠️ ไม่พบอินสแตนซ์ NewPeakBot ที่เพิ่งเปิด กรุณาลองกดปุ่มอีกครั้งหรือตรวจสอบ log")
+                                peak_log("⚠️ ไม่พบอินสแตนซ์ NewPeakBot ที่พร้อมใช้งานหลังสั่งเปิด", "warning")
+                                return
+                        df_source = st.session_state.get("peakengine_source_df")
+                        if df_source is None or df_source.empty:
+                            st.warning("⚠️ ไม่มีข้อมูล Excel ที่โหลดไว้สำหรับประมวลผล")
+                        else:
+                            amount_col = None
+                            if "ยอดเงิน_numeric" in df_source.columns:
+                                amount_col = "ยอดเงิน_numeric"
+                            elif "จำนวนเงิน" in df_source.columns:
+                                amount_col = "จำนวนเงิน"
+                            type_col = "ประเภทผู้ส่งโอน" if "ประเภทผู้ส่งโอน" in df_source.columns else None
+                            dbd_col = "ข้อมูล DBD" if "ข้อมูล DBD" in df_source.columns else None
+                            company_col = None
+                            for candidate in ["ชื่อบริษัทจาก DBD", "ชื่อบัญชีจาก DBD", "ชื่อบริษัท/บุคคล"]:
+                                if candidate in df_source.columns:
+                                    company_col = candidate
+                                    break
+
+                            if not amount_col or not type_col or not dbd_col:
+                                missing_cols = []
+                                if not amount_col:
+                                    missing_cols.append("จำนวนเงิน หรือ ยอดเงิน_numeric")
+                                if not type_col:
+                                    missing_cols.append("ประเภทผู้ส่งโอน")
+                                if not dbd_col:
+                                    missing_cols.append("ข้อมูล DBD")
+                                st.warning(f"⚠️ ไม่พบคอลัมน์ที่จำเป็น: {', '.join(missing_cols)}")
+                            else:
+                                try:
+                                    newpeak_bot = st.session_state.get("active_newpeak_bot")
+                                    if not isinstance(newpeak_bot, NewPeakBot):
+                                        newpeak_bot = wait_for_newpeak_instance(timeout=30, poll_interval=0.5)
+                                        if isinstance(newpeak_bot, NewPeakBot):
+                                            st.session_state["active_newpeak_bot"] = newpeak_bot
+                                            peak_log("ℹ️ ใช้ NewPeakBot ล่าสุดจากคิว", "info")
+                                    if not isinstance(newpeak_bot, NewPeakBot):
+                                        st.warning("⚠️ ไม่พบอินสแตนซ์ NewPeakBot ที่พร้อมใช้งาน")
+                                        peak_log("⚠️ ไม่พบอินสแตนซ์ NewPeakBot ที่พร้อมใช้งาน", "warning")
+                                    else:
+                                        with st.spinner("⏳ กำลังรอให้ NewPeakBot เข้าสู่ระบบ..."):
+                                            if not wait_for_newpeak_login(newpeak_bot, timeout=90, poll_interval=0.5, log_callback=peak_log):
+                                                st.warning("⚠️ ระบบยังไม่ได้เข้าสู่ระบบ New Peak ภายในเวลาที่กำหนด")
+                                                peak_log("⚠️ ระบบยังไม่ได้เข้าสู่ระบบ New Peak ภายในเวลาที่กำหนด", "warning")
+                                                return
+                                        peak_log("✅ พร้อมเริ่มประมวลผลข้อมูลด้วย NewPeakBot", "success")
+                                        tasks, skipped_records = newpeak_bot.prepare_transaction_tasks(
+                                            df_source.copy(),
+                                            amount_column=amount_col,
+                                            type_column=type_col,
+                                            dbd_column=dbd_col,
+                                            company_column=company_col,
+                                        )
+
+                                        selected_registration = st.session_state.get("selected_registration_number", "")
+                                        fill_mode_value = st.session_state.get("peak_fill_mode")
+
+                                        def normalize_registration(value: Any) -> str:
+                                            if value is None or (isinstance(value, float) and pd.isna(value)):
+                                                return ""
+                                            text = str(value).strip()
+                                            digits = "".join(ch for ch in text if ch.isdigit())
+                                            if len(digits) >= 13:
+                                                return digits[-13:]
+                                            if len(digits) == 0:
+                                                return ""
+                                            return digits.zfill(13)
+
+                                        def normalize_company_name(value: Any) -> str:
+                                            if value is None or (isinstance(value, float) and pd.isna(value)):
+                                                return ""
+                                            text = str(value).lower()
+                                            replacements = [
+                                                "บริษัท",
+                                                "จำกัด",
+                                                "มหาชน",
+                                                "(มหาชน)",
+                                                "ห้างหุ้นส่วน",
+                                                "หจก.",
+                                                "บจก.",
+                                                "คอร์ปอเรชั่น",
+                                            ]
+                                            for token in replacements:
+                                                text = text.replace(token.lower(), " ")
+                                            text = re.sub(r"[\"'.,()]", " ", text)
+                                            text = re.sub(r"\s+", " ", text)
+                                            return text.strip()
+
+                                        registrations_in_tasks = [
+                                            normalize_registration(task.get("registration"))
+                                            for task in tasks
+                                            if task.get("registration")
+                                        ]
+                                        if registrations_in_tasks:
+                                            preview_sample = ", ".join(registrations_in_tasks[:10])
+                                            if len(registrations_in_tasks) > 10:
+                                                preview_sample += ", ..."
+                                            peak_log(
+                                                f"🗂 พบเลขทะเบียนในรายการพร้อมใช้งาน: {preview_sample}",
+                                                "info",
+                                            )
+                                        else:
+                                            peak_log(
+                                                "⚠️ ไม่มีเลขทะเบียนในรายการที่ผ่านเงื่อนไข (ตรวจสอบคอลัมน์ข้อมูล DBD และจำนวนเงิน/ประเภทผู้ส่งโอน)",
+                                                "warning",
+                                            )
+
+                                        if fill_mode_value == "กรอกทีละรายการ":
+                                            normalized_selected = normalize_registration(selected_registration)
+                                            if normalized_selected:
+                                                filtered_tasks = [
+                                                    task for task in tasks
+                                                    if normalize_registration(task.get("registration")) == normalized_selected
+                                                ]
+                                                if not filtered_tasks:
+                                                    # หาแถวใน Excel ที่มีเลขทะเบียนตรงกันเพื่อแสดงข้อมูลประกอบ
+                                                    df_matches = pd.DataFrame()
+                                                    selected_rows = pd.DataFrame()
+                                                    if dbd_col in df_source.columns:
+                                                        selected_rows = df_source[
+                                                            df_source[dbd_col]
+                                                            .astype(str)
+                                                            .str.replace(r"\D", "", regex=True)
+                                                            .str[-13:]
+                                                            .fillna("")
+                                                            == normalized_selected
+                                                        ]
+                                                        df_matches = selected_rows.copy()
+                                                    # ถ้าไม่เจอด้วยเลขทะเบียน ให้ลองเทียบตามชื่อบริษัทจาก DBD
+                                                    if df_matches.empty and company_col:
+                                                        normalized_company_series = (
+                                                            df_source[company_col]
+                                                            .astype(str)
+                                                            .apply(normalize_company_name)
+                                                        )
+                                                        target_names: List[str] = []
+                                                        if not selected_rows.empty and company_col in selected_rows.columns:
+                                                            target_names = (
+                                                                selected_rows[company_col]
+                                                                .astype(str)
+                                                                .apply(normalize_company_name)
+                                                                .unique()
+                                                                .tolist()
+                                                            )
+                                                        if target_names:
+                                                            df_matches = df_source[normalized_company_series.isin(target_names)]
+                                                    if not df_matches.empty:
+                                                        peak_log(
+                                                            "ℹ️ พบแถวใน Excel ที่เลขทะเบียนตรงกัน "
+                                                            "แต่ไม่ผ่านเงื่อนไข (อาจเป็นยอดเงินหรือลักษณะผู้ส่งโอน)",
+                                                            "info",
+                                                        )
+                                                        st.info(
+                                                            "ℹ️ พบแถวใน Excel ที่เลขทะเบียนตรงกัน "
+                                                            "แต่ไม่ผ่านเงื่อนไข (ตรวจสอบยอดเงิน/ประเภทผู้ส่งโอน/ข้อมูล DBD)"
+                                                        )
+                                                        display_cols = [
+                                                            col
+                                                            for col in df_matches.columns
+                                                            if col
+                                                            in [
+                                                                "วันที่",
+                                                                amount_col,
+                                                                type_col,
+                                                                dbd_col,
+                                                            ]
+                                                        ]
+                                                        if company_col and company_col in df_matches.columns:
+                                                            display_cols.insert(0, company_col)
+                                                        st.dataframe(
+                                                            df_matches[display_cols],
+                                                            use_container_width=True,
+                                                        )
+                                                    peak_log(
+                                                        f"⚠️ ไม่พบรายการใน Excel ที่ตรงกับเลขทะเบียน {normalized_selected}",
+                                                        "warning",
+                                                    )
+                                                    st.warning(
+                                                        f"⚠️ ไม่พบรายการใน Excel ที่ตรงกับเลขทะเบียน {normalized_selected}"
+                                                    )
+                                                    return
+                                                else:
+                                                    # กรณีพบ task ให้เชื่อมโยงกับชีตสรุปข้อมูล DBD เพื่อดึงเลขทะเบียน 13 หลัก
+                                                    summary_df = st.session_state.get("peakengine_summary_df")
+                                                    summary_registration = ""
+                                                    matched_row_indices = [task.get("row_index") for task in filtered_tasks if task.get("row_index") is not None]
+                                                    matched_rows = (
+                                                        df_source.loc[matched_row_indices]
+                                                        if matched_row_indices
+                                                        else pd.DataFrame()
+                                                    )
+                                                    company_name_candidates = []
+                                                    task_company_candidates = [
+                                                        normalize_company_name(task.get("company_name"))
+                                                        for task in filtered_tasks
+                                                        if task.get("company_name")
+                                                    ]
+                                                    company_name_candidates.extend(
+                                                        [name for name in task_company_candidates if name]
+                                                    )
+                                                    if not matched_rows.empty and company_col and company_col in matched_rows.columns:
+                                                        company_name_candidates = (
+                                                            matched_rows[company_col]
+                                                            .astype(str)
+                                                            .apply(normalize_company_name)
+                                                            .tolist()
+                                                        )
+                                                    if isinstance(summary_df, pd.DataFrame) and not summary_df.empty:
+                                                        name_column = None
+                                                        for candidate_col in ["ชื่อบริษัทจาก DBD", "ชื่อบริษัท", "ชื่อนิติบุคคล"]:
+                                                            if candidate_col in summary_df.columns:
+                                                                name_column = candidate_col
+                                                                break
+                                                        normalized_names = (
+                                                            summary_df[name_column].astype(str).apply(normalize_company_name)
+                                                            if name_column
+                                                            else pd.Series(dtype=str)
+                                                        )
+                                                        summary_df["_normalized_name"] = normalized_names
+                                                        summary_df["_reg_digits"] = (
+                                                            summary_df.get("เลขทะเบียน_พร้อมใช้งาน", summary_df.get("เลขทะเบียน"))
+                                                            .astype(str)
+                                                            .str.replace(r"\D", "", regex=True)
+                                                            .str[-13:]
+                                                            .fillna("")
+                                                        )
+                                                        candidates = summary_df[
+                                                            summary_df["_reg_digits"] == normalized_selected
+                                                        ]
+                                                        if candidates.empty and company_name_candidates:
+                                                            candidates = summary_df[
+                                                                summary_df["_normalized_name"].isin(company_name_candidates)
+                                                            ]
+                                                            if not candidates.empty:
+                                                                summary_registration = candidates["_reg_digits"].iloc[0]
+                                                                st.success(
+                                                                    f"✅ พบเลขทะเบียนในชีต 'สรุปข้อมูล DBD': {summary_registration}"
+                                                                )
+                                                                st.dataframe(
+                                                                    candidates[
+                                                                        [
+                                                                            col
+                                                                            for col in candidates.columns
+                                                                            if col
+                                                                            in [
+                                                                                "ชื่อบริษัทจาก DBD",
+                                                                                "เลขทะเบียน",
+                                                                                "เลขทะเบียน_พร้อมใช้งาน",
+                                                                                "ประเภทธุรกิจ",
+                                                                                "สถานะ",
+                                                                                "ทุนจดทะเบียน",
+                                                                            ]
+                                                                        ]
+                                                                    ],
+                                                                    use_container_width=True,
+                                                                )
+                                                    # แสดงรายละเอียดจากข้อมูล DBD ที่ parse แล้ว
+                                                    details_list = [
+                                                        task.get("dbd_details", {})
+                                                        for task in filtered_tasks
+                                                        if task.get("dbd_details")
+                                                    ]
+                                                    if details_list:
+                                                        st.success(f"✅ พบข้อมูล DBD สำหรับเลขทะเบียน {normalized_selected}")
+                                                        details_df = pd.DataFrame(details_list)
+                                                        st.dataframe(details_df, use_container_width=True)
+                                                        peak_log(
+                                                            f"✅ ดึงข้อมูล DBD แปลงเป็นตารางสำเร็จสำหรับเลขทะเบียน {normalized_selected}",
+                                                            "success",
+                                                        )
+                                                peak_log(
+                                                    f"ℹ️ กำลังประมวลผลเฉพาะเลขทะเบียน {normalized_selected} ({len(filtered_tasks)} รายการ)",
+                                                    "info",
+                                                )
+                                                tasks = filtered_tasks
+                                            else:
+                                                st.warning("⚠️ กรุณาเลือกเลขทะเบียนที่จะกรอกก่อนเริ่มทำงาน")
+                                                peak_log("⚠️ ยังไม่ได้เลือกเลขทะเบียนที่จะกรอก", "warning")
+                                                return
+
+                                        preview_df = pd.DataFrame(tasks)
+                                        skipped_df = pd.DataFrame(skipped_records)
+
+                                        with st.expander("🗂 รายการที่เตรียมกรอก (New Peak)", expanded=True):
+                                            if preview_df.empty:
+                                                st.info("ไม่มีรายการที่ผ่านเงื่อนไขสำหรับ New Peak")
+                                            else:
+                                                preview_columns = [
+                                                    "row_number",
+                                                    "amount",
+                                                    "transfer_type",
+                                                    "dbd_has_data",
+                                                    "registration",
+                                                ]
+                                                if "company_name" in preview_df.columns:
+                                                    preview_columns.append("company_name")
+                                                preview_columns.append("target_url")
+                                                available_preview_columns = [
+                                                    col for col in preview_columns if col in preview_df.columns
+                                                ]
+                                                st.dataframe(
+                                                    preview_df[available_preview_columns],
+                                                    use_container_width=True,
+                                                )
+                                        if not skipped_df.empty:
+                                            with st.expander("⚠️ รายการที่ถูกข้าม (New Peak)", expanded=False):
+                                                st.dataframe(skipped_df, use_container_width=True)
+
+                                        peak_log("🚀 เริ่มประมวลผลข้อมูล Excel สำหรับ New Peak...", "info")
+                                        result = newpeak_bot.process_excel_transactions(
+                                            df_source.copy(),
+                                            amount_column=amount_col,
+                                            type_column=type_col,
+                                            dbd_column=dbd_col,
+                                            company_column=company_col,
+                                            log_callback=peak_log,
+                                            prepared_tasks=tasks,
+                                            skipped_info=skipped_records,
+                                        )
+                                        if "error" in result:
+                                            st.error(f"❌ ไม่สามารถประมวลผลได้: {result['error']}")
+                                        else:
+                                            st.success("✅ ประมวลผลข้อมูลสำหรับ New Peak สำเร็จ")
+                                            col_np1, col_np2, col_np3 = st.columns(3)
+                                            with col_np1:
+                                                st.metric("รายการที่นำทางสำเร็จ", result.get("processed", 0))
+                                            with col_np2:
+                                                st.metric("รายการที่ข้าม", result.get("skipped", 0))
+                                            with col_np3:
+                                                st.metric("ข้อผิดพลาด", len(result.get("errors", [])))
+
+                                            skipped_details = result.get("skipped_details", [])
+                                            if skipped_details:
+                                                with st.expander("ℹ️ รายการที่ถูกข้ามจากเงื่อนไข", expanded=False):
+                                                    st.dataframe(
+                                                        pd.DataFrame(skipped_details),
+                                                        use_container_width=True,
+                                                    )
+                                            if result.get("errors"):
+                                                st.warning("⚠️ รายการที่เกิดข้อผิดพลาด")
+                                                st.dataframe(pd.DataFrame(result["errors"]), use_container_width=True)
+                                except Exception as exc:
+                                    st.error(f"❌ เกิดข้อผิดพลาดระหว่างประมวลผล New Peak: {exc}")
+                                    peak_log(f"❌ เกิดข้อผิดพลาดระหว่างประมวลผล New Peak: {exc}", "error")
+                    else:
+                        st.error("❌ ไม่สามารถเริ่มการทำงานของ NewPeakBot ได้ กรุณาตรวจสอบ log และไฟล์ config.py")
 
 def main():
     st.title("🏦 โปรแกรมแปลงไฟล์ PDF ธนาคารเป็น Excel")
@@ -2279,6 +3099,21 @@ def main():
                             st.info(f"🔗 Link_receipt: {config.Link_receipt}")
                 else:
                     st.error("❌ ไม่สามารถเปิดหน้าเว็บ, login, คลิกปุ่ม PEAK (Deprecated) หรือ navigate ได้")
+    if st.sidebar.button("🆕 เปิดหน้า New Peak Login", use_container_width=True, help="ทดสอบการเข้าสู่ระบบ https://secure.peakaccount.com ด้วย NewPeakBot และ navigate ตาม config.py", key="open_newpeak_btn"):
+        with st.sidebar:
+            with st.spinner("กำลังเปิดหน้าเว็บ New Peak, กรอกข้อมูล และนำทางไปยังลิงก์..."):
+                if open_newpeak_login():
+                    st.success("✅ สั่งเปิด Browser สำหรับระบบ New Peak สำเร็จ! ดูหน้าต่างที่เปิดขึ้นมาเพื่อดูการทำงานของบอท")
+                    if config:
+                        username = getattr(config, "NEWPEAK_USERNAME", getattr(config, "PEAKENGINE_USERNAME", ""))
+                        if username:
+                            st.info(f"📧 Username: {username}")
+                        if hasattr(config, "Link_compay_newpeak"):
+                            st.info(f"🔗 Link_compay_newpeak: {getattr(config, 'Link_compay_newpeak')}")
+                        if hasattr(config, "Link_receipt_newpeak"):
+                            st.info(f"🔗 Link_receipt_newpeak: {getattr(config, 'Link_receipt_newpeak')}")
+                else:
+                    st.error("❌ ไม่สามารถเริ่มการทำงานของ NewPeakBot ได้ กรุณาตรวจสอบ log และไฟล์ config.py")
     
     st.sidebar.markdown("---")
     

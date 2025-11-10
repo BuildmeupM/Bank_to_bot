@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Callable, Any
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+from datetime import datetime
 
 # ตั้งค่า logging
 logging.basicConfig(level=logging.INFO)
@@ -539,10 +540,12 @@ class PeakEngineBot:
                             return False
                         
                         log("✅ กรอกข้อมูลและคลิกปุ่ม Login สำเร็จแล้ว", "success")
+                        self.is_logged_in = True
                         return True
                         
                     except Exception as e:
                         log(f"❌ เกิดข้อผิดพลาด: {str(e)}", "error")
+                        self.is_logged_in = False
                         return False
                 
                 return loop.run_until_complete(async_fill())
@@ -571,6 +574,270 @@ class PeakEngineBot:
         """
         # เรียกใช้ open_login_page_and_fill() แทน
         return self.open_login_page_and_fill(username, password, link_company=link_company, link_receipt=link_receipt, log_callback=log_callback)
+    
+    def fill_contact_fields(
+        self,
+        values: List[str],
+        field_selector: str = '//*[@id="iptcontactname"]',
+        reg_info_map: Optional[Dict[str, Any]] = None,
+        log_callback: Optional[Callable] = None
+    ) -> Dict[str, Any]:
+        """
+        กรอกข้อมูลลงช่องผู้ติดต่อทีละรายการตามค่าที่ได้รับ
+        """
+        def log(message: str, status: str = "info"):
+            if log_callback:
+                try:
+                    log_callback(message, status)
+                except:
+                    pass
+            logger.info(message)
+
+        if not self.use_browser or not self.page:
+            log("❌ Browser ยังไม่ได้เปิด", "error")
+            return {"error": "Browser ยังไม่ได้เปิด"}
+
+        if not self.is_logged_in:
+            log("⚠️ ยังไม่ได้ Login - กรุณา Login ก่อน", "warning")
+            return {"error": "ยังไม่ได้ Login"}
+
+        def normalize_value(raw) -> str:
+            if raw is None:
+                return ""
+            value_str = str(raw).strip()
+            if not value_str:
+                return ""
+            digits = "".join(ch for ch in value_str if ch.isdigit())
+            if not digits:
+                return ""
+            digits = digits[-13:]
+            if len(digits) < 13:
+                digits = digits.zfill(13)
+            if digits[0] != "0":
+                digits = "0" + digits[1:]
+            return digits
+
+        clean_values = []
+        for v in values:
+            normalized = normalize_value(v)
+            if normalized:
+                clean_values.append(normalized)
+
+        if not clean_values:
+            log("⚠️ ไม่มีค่าที่พร้อมสำหรับกรอก", "warning")
+            return {"total": 0, "success": 0, "errors": []}
+
+        def fill_async():
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+            except:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            async def async_fill():
+                results = {
+                    "total": len(clean_values),
+                    "success": 0,
+                    "errors": [],
+                    "processed": [],
+                    "dropdown_options": [],
+                    "plus_clicked": [],
+                    "selected_existing": [],
+                    "validation": []
+                }
+
+                for idx, value in enumerate(clean_values, 1):
+                    try:
+                        log(f"✏️ ({idx}/{len(clean_values)}) กำลังกรอกเลขทะเบียน: {value}", "info")
+                        input_element = await self.page.wait_for_selector(field_selector, timeout=5000)
+                        await input_element.click()
+                        try:
+                            await input_element.fill("")
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.1)
+                        await input_element.fill(value)
+                        log(f"✅ กรอก {value} สำเร็จ", "success")
+                        results["success"] += 1
+                        results["processed"].append(value)
+                        reg_info = reg_info_map.get(value) if reg_info_map else None
+                        dropdown_items = []
+                        selectable_option = None
+                        existing_selected = False
+                        selectable_text = None
+                        plus_option = None
+                        dropdown_container = None
+                        dropdown_selectors = [
+                            '//*[@id="ui-id-15"]',
+                            '//*[@id="ui-id-4"]',
+                            '//ul[contains(@class,"ui-autocomplete")]'
+                        ]
+                        for selector in dropdown_selectors:
+                            try:
+                                dropdown_container = await self.page.wait_for_selector(selector, timeout=1500)
+                                if dropdown_container:
+                                    try:
+                                        is_visible = await dropdown_container.is_visible()
+                                    except Exception:
+                                        is_visible = True
+                                    if is_visible:
+                                        break
+                            except Exception:
+                                dropdown_container = None
+
+                        plus_option_clicked = False
+                        if dropdown_container:
+                            try:
+                                option_elements = await dropdown_container.query_selector_all('li')
+                                for option in option_elements:
+                                    try:
+                                        option_text = await option.inner_text()
+                                        cleaned_text = option_text.strip()
+                                        if cleaned_text:
+                                            dropdown_items.append(cleaned_text)
+                                        if cleaned_text.startswith('+ เพิ่มผู้ติดต่อ') and selectable_option is None:
+                                            plus_option = option
+                                        elif selectable_option is None:
+                                            selectable_option = option
+                                            selectable_text = cleaned_text
+                                    except Exception:
+                                        continue
+
+                                if dropdown_items:
+                                    if dropdown_items == ['+ เพิ่มผู้ติดต่อ'] and plus_option is not None:
+                                        try:
+                                            await plus_option.click()
+                                            plus_option_clicked = True
+                                            log("🖱️ คลิก '+ เพิ่มผู้ติดต่อ' เพื่อเพิ่มผู้ติดต่อใหม่", "info")
+                                            await asyncio.sleep(1)
+                                        except Exception as click_error:
+                                            log(f"⚠️ คลิก '+ เพิ่มผู้ติดต่อ' ไม่สำเร็จ: {click_error}", "warning")
+                                    elif selectable_option is not None:
+                                        try:
+                                            await selectable_option.click()
+                                            chosen_text = selectable_text or dropdown_items[min(1, len(dropdown_items)-1)]
+                                            log(f"✅ เลือกรายการ '{chosen_text}' จาก dropdown", "success")
+                                            await asyncio.sleep(0.5)
+                                            existing_selected = True
+                                            results.setdefault("selected_existing", []).append(value)
+                                        except Exception as select_error:
+                                            log(f"⚠️ เลือกรายการจาก dropdown ไม่สำเร็จ: {select_error}", "warning")
+                            except Exception:
+                                dropdown_items = []
+
+                        if dropdown_items:
+                            log(f"🧾 ตัวเลือก dropdown ({len(dropdown_items)}): {', '.join(dropdown_items[:5])}", "info")
+                        else:
+                            log("ℹ️ ไม่พบตัวเลือกใน dropdown หลังกรอกเลขทะเบียน", "info")
+
+                        results["dropdown_options"].append({
+                            "value": value,
+                            "items": dropdown_items
+                        })
+                        if plus_option_clicked:
+                            results["plus_clicked"].append(value)
+                            try:
+                                log("⏳ รอหน้าต่างเพิ่มผู้ติดต่อแสดงผล...", "info")
+                                modal_field = await self.page.wait_for_selector('#mdccipttaxid1', timeout=5000)
+                                if modal_field:
+                                    log("✅ พบหน้าต่างเพิ่มผู้ติดต่อ - กำลังกรอกเลข 13 หลัก", "success")
+                                    for idx_digit, digit in enumerate(value[:13], start=1):
+                                        input_selector = f'#mdccipttaxid{idx_digit}'
+                                        try:
+                                            digit_input = await self.page.wait_for_selector(input_selector, timeout=1000)
+                                            if digit_input:
+                                                await digit_input.click()
+                                                await digit_input.fill(digit)
+                                                await asyncio.sleep(0.05)
+                                        except Exception as digit_error:
+                                            log(f"⚠️ กรอกเลขหลักที่ {idx_digit} ไม่สำเร็จ: {digit_error}", "warning")
+                                    log("✅ กรอกเลข 13 หลักในหน้าต่างเพิ่มผู้ติดต่อเรียบร้อย", "success")
+
+                                    try:
+                                        search_button = await self.page.wait_for_selector('#contactgetinfobtn', timeout=2000)
+                                        if search_button:
+                                            log("🔍 กำลังกดปุ่ม 'ค้นหา'", "info")
+                                            await search_button.click()
+                                            await asyncio.sleep(0.5)
+                                            for _ in range(40):
+                                                status_text = ""
+                                                try:
+                                                    status_element = await self.page.wait_for_selector('#mdccperrmsg', timeout=200)
+                                                    if status_element:
+                                                        status_text = (await status_element.inner_text() or "").strip()
+                                                except Exception:
+                                                    status_text = ""
+                                                if status_text and ("ไม่พบข้อมูลลูกค้า" in status_text or "ค้นหาสำเร็จ" in status_text):
+                                                    break
+                                                await asyncio.sleep(0.2)
+                                            else:
+                                                log("⚠️ ไม่ได้รับสถานะตอบกลับจากปุ่มค้นหาภายในเวลาที่กำหนด", "warning")
+                                    except Exception as search_error:
+                                        log(f"⚠️ ไม่สามารถกดปุ่มค้นหาได้: {search_error}", "warning")
+
+                                    not_found = False
+                                    success_found = False
+                                    try:
+                                        error_element = await self.page.wait_for_selector('#mdccperrmsg', timeout=3000)
+                                        if error_element:
+                                            error_text = (await error_element.inner_text() or "").strip()
+                                            if "ไม่พบข้อมูลลูกค้า" in error_text:
+                                                not_found = True
+                                                log("ℹ️ ระบบไม่พบข้อมูลลูกค้าในฐานข้อมูล", "warning")
+                                            elif "ค้นหาสำเร็จ" in error_text:
+                                                success_found = True
+                                                log("✅ ระบบค้นหาข้อมูลลูกค้าเรียบร้อย", "success")
+                                    except Exception:
+                                        pass
+
+                                    if plus_option_clicked:
+                                        if not_found and reg_info:
+                                            await self._fill_contact_from_excel(value, reg_info, log)
+                                            validation = await self._compare_contact_fields(reg_info, log)
+                                            if validation:
+                                                results.setdefault("validation", []).append(validation)
+                                                if validation.get("overall_match"):
+                                                    await self._confirm_create_contact(log)
+                                                    await self._post_validation_tasks(reg_info, log)
+                                        elif not_found and not reg_info:
+                                            log("⚠️ ไม่มีข้อมูลในไฟล์ Excel สำหรับเติมในหน้าต่างเพิ่มผู้ติดต่อ", "warning")
+                                        else:
+                                            if success_found and reg_info:
+                                                validation = await self._compare_contact_fields(reg_info, log)
+                                                if validation:
+                                                    results.setdefault("validation", []).append(validation)
+                                                    if validation.get("overall_match"):
+                                                        await self._confirm_create_contact(log)
+                                                        await self._post_validation_tasks(reg_info, log)
+                                            elif success_found:
+                                                log("ℹ️ ระบบค้นหาสำเร็จแต่ไม่มีข้อมูล Excel สำหรับตรวจสอบ", "info")
+                                    elif existing_selected and reg_info:
+                                        await self._post_validation_tasks(reg_info, log)
+                                else:
+                                    log("⚠️ ไม่พบช่องกรอกเลข 13 หลักในหน้าต่างเพิ่มผู้ติดต่อ", "warning")
+                            except Exception as modal_error:
+                                log(f"⚠️ ไม่สามารถกรอกข้อมูลในหน้าต่างเพิ่มผู้ติดต่อ: {modal_error}", "warning")
+                        elif existing_selected:
+                            log("ℹ️ เลือกผู้ติดต่อที่มีอยู่แล้ว - ดำเนินกรอกข้อมูลต่อ", "info")
+                            if reg_info:
+                                await self._post_validation_tasks(reg_info, log)
+                            else:
+                                log("ℹ️ ไม่มีข้อมูลจาก Excel สำหรับดำเนินการต่อ", "info")
+                        await asyncio.sleep(0.2)
+                    except Exception as e:
+                        error_msg = str(e)
+                        log(f"❌ กรอก {value} ไม่สำเร็จ: {error_msg}", "error")
+                        results["errors"].append({"index": idx, "value": value, "error": error_msg})
+                        await asyncio.sleep(0.2)
+
+                return results
+
+            return loop.run_until_complete(async_fill())
+
+        return self._executor.submit(fill_async).result(timeout=300)
     
     def execute_workflow(self, steps: List[Dict[str, Any]], log_callback: Optional[Callable] = None) -> Dict[str, Any]:
         """
@@ -758,6 +1025,487 @@ class PeakEngineBot:
         except Exception as e:
             logger.error(f"Error extracting table data: {str(e)}")
             return pd.DataFrame()
+    
+    async def _fill_contact_from_excel(self, registration_number: str, info: Dict[str, Any], log: Callable[[str, str], None]) -> None:
+        try:
+            dbd_info = info.get("dbd_info", {}) or {}
+            row_data = info.get("row", {}) or {}
+            transfer_type = info.get("transfer_type", "")
+            company_name_raw = info.get("company_name", "") or dbd_info.get("ชื่อบริษัท")
+
+            if transfer_type and "บริษัท (บจก.)" in transfer_type:
+                try:
+                    dropdown = await self.page.wait_for_selector('#mdccddlmerchanttype', timeout=2000)
+                    if dropdown:
+                        current_value = await dropdown.inner_text()
+                        if "บริษัทจำกัด" not in current_value:
+                            await dropdown.click()
+                            await asyncio.sleep(0.2)
+                            option = await self.page.wait_for_selector('#mdccddlmerchanttype .menu .item[data-value="2"]', timeout=2000)
+                            if option:
+                                await option.click()
+                                log("✅ เลือกประเภทนิติบุคคล 'บริษัทจำกัด'", "success")
+                except Exception as e:
+                    log(f"⚠️ ไม่สามารถเลือกประเภทบริษัทจำกัด: {e}", "warning")
+
+            if company_name_raw:
+                cleaned_name = self._clean_company_name(company_name_raw)
+                try:
+                    name_input = await self.page.wait_for_selector('#contactmerchantname', timeout=2000)
+                    if name_input:
+                        await name_input.click()
+                        await name_input.fill(cleaned_name)
+                        log(f"✅ กรอกชื่อกิจการ: {cleaned_name}", "success")
+                except Exception as e:
+                    log(f"⚠️ ไม่สามารถกรอกชื่อกิจการ: {e}", "warning")
+
+            if dbd_info or row_data:
+                combined_address = self._format_main_address(row_data)
+                address_text = combined_address or self._normalize_component(row_data.get("ที่อยู่")) or self._normalize_component(dbd_info.get("ที่อยู่"))
+                if address_text:
+                    try:
+                        address_input = await self.page.wait_for_selector('#customerThAddress', timeout=1000)
+                        if address_input:
+                            await address_input.click()
+                            await address_input.fill(address_text)
+                            log("✅ กรอกที่อยู่จากข้อมูล DBD", "success")
+                    except Exception:
+                        pass
+
+                subdistrict = self._normalize_component(row_data.get("ที่อยู่_ตำบล")) or self._normalize_component(dbd_info.get("แขวง/ตำบล"))
+                if subdistrict:
+                    try:
+                        district1_input = await self.page.wait_for_selector('#customerThDistrict1', timeout=1000)
+                        if district1_input:
+                            await district1_input.click()
+                            await district1_input.fill(subdistrict)
+                            log("✅ กรอกแขวง/ตำบลจากข้อมูล DBD", "success")
+                    except Exception:
+                        pass
+
+                district = self._normalize_component(row_data.get("ที่อยู่_อำเภอ")) or self._normalize_component(dbd_info.get("เขต/อำเภอ"))
+                if district:
+                    try:
+                        district2_input = await self.page.wait_for_selector('#customerThDistrict2', timeout=1000)
+                        if district2_input:
+                            await district2_input.click()
+                            await district2_input.fill(district)
+                            log("✅ กรอกเขต/อำเภอจากข้อมูล DBD", "success")
+                    except Exception:
+                        pass
+
+                province = self._normalize_component(row_data.get("ที่อยู่_จังหวัด")) or self._normalize_component(dbd_info.get("จังหวัด"))
+                if province:
+                    try:
+                        province_input = await self.page.wait_for_selector('#customerThProvince', timeout=1000)
+                        if province_input:
+                            await province_input.click()
+                            await province_input.fill(province)
+                            log("✅ กรอกจังหวัดจากข้อมูล DBD", "success")
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"⚠️ เกิดข้อผิดพลาดในการเติมข้อมูลจาก Excel: {e}", "warning")
+
+    async def _compare_contact_fields(self, info: Dict[str, Any], log: Callable[[str, str], None]) -> Optional[Dict[str, Any]]:
+        row_data = info.get("row", {})
+        if not row_data:
+            log("⚠️ ไม่มีข้อมูลใน Excel สำหรับใช้ตรวจสอบความถูกต้อง", "warning")
+            return None
+
+        dbd_info = info.get("dbd_info", {}) or {}
+
+        async def get_value(selector: str) -> str:
+            try:
+                element = await self.page.wait_for_selector(selector, timeout=1000)
+                if not element:
+                    return ""
+                try:
+                    value = await element.input_value()
+                except Exception:
+                    value = await element.get_attribute("value")
+                return (value or "").strip()
+            except Exception:
+                return ""
+
+        def normalize(text: Any) -> str:
+            if text is None or (isinstance(text, float) and pd.isna(text)):  # type: ignore
+                return ""
+            return re.sub(r"\s+", " ", str(text).strip()).casefold()
+
+        comparisons = []
+
+        expected_name = self._clean_company_name(info.get("company_name") or row_data.get("ชื่อบริษัทจาก DBD") or "")
+        actual_name = await get_value("#contactmerchantname")
+        comparisons.append({
+            "field": "ชื่อกิจการ",
+            "expected": expected_name,
+            "actual": actual_name,
+            "match": normalize(expected_name) == normalize(actual_name)
+        })
+
+        expected_main_address = self._format_main_address(row_data)
+        actual_main_address = await get_value("#customerThAddress")
+        comparisons.append({
+            "field": "ที่อยู่ (บ้านเลขที่/หมู่บ้าน/หมู่ที่)",
+            "expected": expected_main_address,
+            "actual": actual_main_address,
+            "match": normalize(expected_main_address) == normalize(actual_main_address)
+        })
+
+        expected_subdistrict = self._normalize_component(row_data.get("ที่อยู่_ตำบล")) or self._normalize_component(dbd_info.get("แขวง/ตำบล"))
+        actual_subdistrict = await get_value("#customerThDistrict1")
+        comparisons.append({
+            "field": "แขวง/ตำบล",
+            "expected": expected_subdistrict,
+            "actual": actual_subdistrict,
+            "match": normalize(expected_subdistrict) == normalize(actual_subdistrict)
+        })
+
+        expected_district = self._normalize_component(row_data.get("ที่อยู่_อำเภอ")) or self._normalize_component(dbd_info.get("เขต/อำเภอ"))
+        actual_district = await get_value("#customerThDistrict2")
+        comparisons.append({
+            "field": "เขต/อำเภอ",
+            "expected": expected_district,
+            "actual": actual_district,
+            "match": normalize(expected_district) == normalize(actual_district)
+        })
+
+        expected_province = self._normalize_component(row_data.get("ที่อยู่_จังหวัด")) or self._normalize_component(dbd_info.get("จังหวัด"))
+        actual_province = await get_value("#customerThProvince")
+        comparisons.append({
+            "field": "จังหวัด",
+            "expected": expected_province,
+            "actual": actual_province,
+            "match": normalize(expected_province) == normalize(actual_province)
+        })
+
+        all_match = all(item["match"] for item in comparisons)
+        if all_match:
+            log("✅ ข้อมูลที่ระบบค้นหากลับมาตรงกับข้อมูลใน Excel", "success")
+        else:
+            log("⚠️ ข้อมูลที่ระบบค้นหากลับมาไม่ตรงกับ Excel บางรายการ", "warning")
+
+        validation_result = {
+            "registration": info.get("registration"),
+            "overall_match": all_match,
+            "details": comparisons
+        }
+
+        return validation_result
+
+    async def _post_validation_tasks(self, info: Dict[str, Any], log: Callable[[str, str], None]) -> None:
+        row_data = info.get("row", {}) or {}
+        desired_date = self._normalize_component(row_data.get("วันที่")) or self._normalize_component(info.get("date"))
+        if not await self._wait_for_document_number_ready(log):
+            return
+        if desired_date:
+            await self._fill_document_date(desired_date, log)
+        else:
+            log("ℹ️ ไม่มีข้อมูลวันที่จาก Excel สำหรับกรอก", "info")
+        await self._fill_tarremark(row_data, log)
+        await self._fill_product_template(log)
+
+    async def _wait_for_document_number_ready(self, log: Callable[[str, str], None]) -> bool:
+        try:
+            await self.page.wait_for_selector('#iptnumber', timeout=5000, state='visible')
+            log("✅ ช่องเอกสารเลขที่ (#iptnumber) พร้อมสำหรับกรอก", "success")
+            return True
+        except Exception as e:
+            log(f"❌ ไม่พบช่องเอกสารเลขที่ (#iptnumber): {e}", "error")
+            return False
+
+    def _clean_company_name(self, company_name: str) -> str:
+        if not company_name:
+            return ""
+        name = company_name.strip()
+        patterns = [
+            r'^\s*บริษัท\s+',
+            r'\s+จำกัด\s*(\(มหาชน\))?$',
+            r'^\s*บริษัทมหาชนจำกัด\s+',
+            r'^\s*ห้างหุ้นส่วนจำกัด\s+'
+        ]
+        for pattern in patterns:
+            name = re.sub(pattern, '', name, flags=re.IGNORECASE)
+        return name.strip()
+    
+    async def _fill_document_date(self, desired_date: str, log: Callable[[str, str], None]) -> None:
+        formatted_date = self._format_target_date(desired_date)
+        if not formatted_date:
+            log(f"⚠️ ไม่สามารถตีความวันที่ '{desired_date}' ได้", "warning")
+            return
+        try:
+            date_input = await self.page.wait_for_selector('#iptdate', timeout=2000)
+            if date_input:
+                await date_input.click()
+                await date_input.fill("")
+                await date_input.fill(formatted_date)
+                log(f"✅ กรอกวันที่ออกเอกสาร: {formatted_date}", "success")
+            else:
+                log("⚠️ ไม่พบช่องกรอกวันที่ออกเอกสาร", "warning")
+        except Exception as e:
+            log(f"⚠️ ไม่สามารถกรอกวันที่ออกเอกสาร: {e}", "warning")
+
+    async def _fill_product_template(self, log: Callable[[str, str], None]) -> None:
+        try:
+            product_input = await self.page.wait_for_selector('#iptproducttemplateid1', timeout=2000)
+            if not product_input:
+                log("⚠️ ไม่พบช่องกรอกสินค้า/บริการ", "warning")
+                return
+            await product_input.click()
+            await product_input.fill("P00001")
+            await asyncio.sleep(0.3)
+
+            product_selectors = [
+                '//ul[contains(@class,"ui-autocomplete")]/li[contains(@id,"ui-id") and contains(.,"P00001")]',
+                '//li[contains(@class,"ui-menu-item") and contains(.,"P00001")]'
+            ]
+            for selector in product_selectors:
+                try:
+                    option = await self.page.wait_for_selector(selector, timeout=1000)
+                    if option:
+                        await option.click()
+                        log("✅ เลือกสินค้า/บริการ 'P00001 - ไลฟ์สดสินค้าเทศกาลเจนนี่'", "success")
+                        break
+                except Exception:
+                    continue
+            else:
+                log("⚠️ ไม่พบรายการ 'P00001' ใน dropdown สินค้า/บริการ", "warning")
+                return
+
+            desired_description = "ไลฟ์สดสินค้าเทศกาลเจนนี่"
+            try:
+                description_area = await self.page.wait_for_selector('#iptdescription1', timeout=2000)
+                if description_area:
+                    desired_description = "ไลฟ์สดสินค้าเทศกาลเจนนี่"
+
+                    async def apply_description() -> bool:
+                        for attempt in range(3):
+                            await description_area.click()
+                            try:
+                                await description_area.press("Control+A")
+                            except Exception:
+                                try:
+                                    await description_area.press("Meta+A")
+                                except Exception:
+                                    pass
+                            await description_area.press("Delete")
+                            await description_area.fill(desired_description)
+                            try:
+                                await self.page.evaluate(
+                                    """(value) => {
+                                        const el = document.querySelector('#iptdescription1');
+                                        if (el) {
+                                            el.value = value;
+                                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                                        }
+                                    }""",
+                                    desired_description
+                                )
+                            except Exception:
+                                pass
+
+                            current_value = ""
+                            try:
+                                current_value = await description_area.input_value()
+                            except Exception:
+                                current_value = await self.page.evaluate(
+                                    """() => {
+                                        const el = document.querySelector('#iptdescription1');
+                                        return el ? el.value || '' : '';
+                                    }"""
+                                )
+
+                            if current_value.strip() == desired_description:
+                                log("✅ ปรับรายละเอียดสินค้าเป็น 'ไลฟ์สดสินค้าเทศกาลเจนนี่'", "success")
+                                return True
+
+                            if attempt < 2:
+                                log("⚠️ รายละเอียดสินค้ายังไม่ตรง รอ 0.5 วินาทีแล้วลองอีกครั้ง", "warning")
+                                await asyncio.sleep(0.5)
+
+                        log("❌ ไม่สามารถตั้งรายละเอียดสินค้าให้ตรงกับค่าที่ต้องการได้", "error")
+                        return False
+
+                    first_apply_success = await apply_description()
+
+                    if first_apply_success:
+                        try:
+                            amount_field = await self.page.wait_for_selector('#iptamount1', timeout=2000)
+                            if amount_field:
+                                await amount_field.click()
+                                await asyncio.sleep(0.1)
+                                log("✅ คลิกช่องจำนวน (#iptamount1) เพื่อแก้ไขค่า", "success")
+                            else:
+                                log("⚠️ ไม่พบช่องจำนวน (#iptamount1)", "warning")
+                        except Exception as amount_error:
+                            log(f"⚠️ ไม่สามารถคลิกช่องจำนวน (#iptamount1): {amount_error}", "warning")
+
+                        await apply_description()
+                else:
+                    log("⚠️ ไม่พบช่องรายละเอียดสินค้า (#iptdescription1)", "warning")
+            except Exception as desc_error:
+                log(f"⚠️ ไม่สามารถปรับรายละเอียดสินค้า: {desc_error}", "warning")
+        except Exception as e:
+            log(f"⚠️ ไม่สามารถเลือกสินค้า/บริการ: {e}", "warning")
+
+    async def _fill_tarremark(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> None:
+        description_text = self._normalize_component(row_data.get("คำอธิบาย"))
+        account_suffix = self._extract_account_suffix(description_text)
+        if not account_suffix:
+            log("ℹ️ ไม่พบเลขบัญชี 4 หลักสำหรับใส่ในหมายเหตุ", "info")
+        date_text = self._normalize_component(row_data.get("วันที่"))
+        time_text = self._normalize_component(row_data.get("เวลา"))
+        if not date_text and not time_text:
+            combined = (
+                self._normalize_component(row_data.get("วันที่ เวลา X5711"))
+                or self._normalize_component(row_data.get("วันที่ เวลา"))
+                or ""
+            )
+            if combined:
+                parts = combined.split()
+                if parts:
+                    date_text = parts[0]
+                if len(parts) > 1:
+                    time_text = parts[1]
+
+        if date_text:
+            formatted_date = self._format_target_date(date_text)
+            if formatted_date:
+                date_text = formatted_date
+
+        date_time_text = " ".join(filter(None, [date_text, time_text])).strip()
+
+        if not date_time_text and not account_suffix:
+            log("ℹ️ ไม่มีข้อมูลสำหรับกรอกอ้างอิง (#iptrefname)", "info")
+            return
+        remark_value = date_time_text.strip()
+        if account_suffix:
+            remark_value = f"{remark_value} {account_suffix}".strip()
+        try:
+            remark_field = await self.page.wait_for_selector('#iptrefname', timeout=2000)
+            if not remark_field:
+                log("⚠️ ไม่พบช่องอ้างอิง (#iptrefname)", "warning")
+                return
+            await remark_field.click()
+            try:
+                await remark_field.press("Control+A")
+            except Exception:
+                try:
+                    await remark_field.press("Meta+A")
+                except Exception:
+                    pass
+            await remark_field.press("Delete")
+            await remark_field.fill(remark_value)
+            try:
+                await self.page.evaluate(
+                    """(value) => {
+                        const el = document.querySelector('#iptrefname');
+                        if (el) {
+                            el.value = value;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }""",
+                    remark_value
+                )
+            except Exception:
+                pass
+            log(f"✅ กรอกอ้างอิงเป็น '{remark_value}'", "success")
+        except Exception as e:
+            log(f"⚠️ ไม่สามารถกรอกอ้างอิง: {e}", "warning")
+
+    def _format_target_date(self, value: str) -> Optional[str]:
+        if not value:
+            return None
+        text = value.strip()
+        fmt_list = [
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%d/%m/%y",
+            "%Y-%m-%d",
+            "%d %b %Y",
+            "%d %b %y"
+        ]
+        for fmt in fmt_list:
+            try:
+                dt = datetime.strptime(text, fmt)
+                return dt.strftime("%d/%m/%Y")
+            except Exception:
+                continue
+        thai_pattern = re.match(r"(\d{1,2})\s+([ก-๙]+)\s+(\d{4})", text)
+        if thai_pattern:
+            day = int(thai_pattern.group(1))
+            month_name = thai_pattern.group(2)
+            year = int(thai_pattern.group(3))
+            thai_months = {
+                "ม.ค.": 1, "มกราคม": 1,
+                "ก.พ.": 2, "กุมภาพันธ์": 2,
+                "มี.ค.": 3, "มีนาคม": 3,
+                "เม.ย.": 4, "เมษายน": 4,
+                "พ.ค.": 5, "พฤษภาคม": 5,
+                "มิ.ย.": 6, "มิถุนายน": 6,
+                "ก.ค.": 7, "กรกฎาคม": 7,
+                "ส.ค.": 8, "สิงหาคม": 8,
+                "ก.ย.": 9, "กันยายน": 9,
+                "ต.ค.": 10, "ตุลาคม": 10,
+                "พ.ย.": 11, "พฤศจิกายน": 11,
+                "ธ.ค.": 12, "ธันวาคม": 12
+            }
+            month = thai_months.get(month_name, 0)
+            if not month:
+                return None
+            if year > 2500:
+                year -= 543
+            try:
+                dt = datetime(year, month, day)
+                return dt.strftime("%d/%m/%Y")
+            except Exception:
+                return None
+        return None
+    
+    async def _confirm_create_contact(self, log: Callable[[str, str], None]) -> None:
+        try:
+            create_button = await self.page.wait_for_selector('#contactcreatebtn', timeout=2000)
+            if create_button:
+                log("📝 กำลังกดปุ่ม 'เพิ่มลูกค้า/ผู้จ่ายเงิน'", "info")
+                await create_button.click()
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            log(f"⚠️ ไม่สามารถกดปุ่มเพิ่มลูกค้า/ผู้จ่ายเงินได้: {e}", "warning")
+    
+    def _normalize_component(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, float):
+            if pd.isna(value):
+                return ""
+            if value.is_integer():
+                value = int(value)
+        text = str(value).strip()
+        return "" if text in ("", "0", "-", "--") else text
+
+    def _extract_account_suffix(self, description: str) -> Optional[str]:
+        if not description:
+            return None
+        match = re.search(r'X(\d{4})', description)
+        if match:
+            return f"X{match.group(1)}"
+        return None
+
+    def _format_main_address(self, row_data: Dict[str, Any]) -> str:
+        house = self._normalize_component(row_data.get("ที่อยู่_บ้านเลขที่"))
+        village = self._normalize_component(row_data.get("ที่อยู่_หมู่บ้าน"))
+        moo = self._normalize_component(row_data.get("ที่อยู่_หมู่ที่"))
+        parts = []
+        if house:
+            parts.append(f"เลขที่ {house}")
+        if village:
+            parts.append(f"หมู่บ้าน {village}")
+        if moo:
+            parts.append(f"หมู่ {moo}")
+        return " ".join(parts).strip()
     
     def close(self):
         """Close browser"""
