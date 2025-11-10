@@ -9,9 +9,10 @@ st.set_page_config(
 
 import pandas as pd
 import pdfplumber
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import re
+import zipfile
 from typing import Dict, List, Tuple, Optional, Any
 import os
 import sys
@@ -2388,6 +2389,75 @@ def render_receipt_bot_page():
             results[key.strip()] = value.strip()
         return results
 
+    def slugify_filename(value: Any) -> str:
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none"}:
+            return "type"
+        sanitized = re.sub(r"[^\wก-๙\-]+", "_", text)
+        sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+        return sanitized or "type"
+
+    def build_summary_from_source(source_df: pd.DataFrame) -> pd.DataFrame:
+        if source_df is None or source_df.empty:
+            return pd.DataFrame()
+
+        summary_rows: List[Dict[str, Any]] = []
+        for _, row in source_df.iterrows():
+            dbd_parsed = parse_dbd_info(row.get("ข้อมูล DBD", ""))
+            reg_candidates = [
+                row.get("เลขทะเบียน"),
+                row.get("เลขทะเบียนจาก DBD"),
+                row.get("เลขทะเบียนนิติบุคคล"),
+                dbd_parsed.get("เลขทะเบียน")
+            ]
+            normalized_reg = ""
+            for candidate in reg_candidates:
+                normalized_reg = normalize_registration_number(candidate)
+                if normalized_reg:
+                    break
+            if not normalized_reg:
+                continue
+
+            summary_row: Dict[str, Any] = {}
+            columns_to_preserve = [
+                "เลขทะเบียน",
+                "เลขทะเบียนจาก DBD",
+                "เลขทะเบียนนิติบุคคล",
+                "ชื่อบริษัท/บุคคล",
+                "ชื่อบริษัทจาก DBD",
+                "ประเภทผู้ส่งโอน",
+                "ข้อมูล DBD",
+                "สถานะข้อมูล DBD",
+                "ประเภทธุรกิจ",
+                "สถานะกิจการ",
+                "ทุนจดทะเบียน",
+                "ที่อยู่",
+                "ที่อยู่_บ้านเลขที่",
+                "ที่อยู่_หมู่บ้าน",
+                "ที่อยู่_หมู่ที่",
+                "ที่อยู่_ตำบล",
+                "ที่อยู่_อำเภอ",
+                "ที่อยู่_จังหวัด",
+                "ที่อยู่_รหัสไปรษณีย์"
+            ]
+            for column_name in columns_to_preserve:
+                if column_name in row:
+                    summary_row[column_name] = row.get(column_name, "")
+
+            summary_row["เลขทะเบียน_พร้อมใช้งาน"] = normalized_reg
+            summary_row["ประเภทธุรกิจจาก DBD"] = summary_row.get("ประเภทธุรกิจ", "") or dbd_parsed.get("ประเภทธุรกิจ", "")
+            summary_row["สถานะจาก DBD"] = summary_row.get("สถานะกิจการ", "") or dbd_parsed.get("สถานะ", "")
+            summary_row["ทุนจดทะเบียนจาก DBD"] = summary_row.get("ทุนจดทะเบียน", "") or dbd_parsed.get("ทุนจดทะเบียน", "")
+            summary_row["ที่อยู่จาก DBD"] = summary_row.get("ที่อยู่", "") or dbd_parsed.get("ที่อยู่", "")
+
+            summary_rows.append(summary_row)
+
+        if not summary_rows:
+            return pd.DataFrame()
+
+        summary_df = pd.DataFrame(summary_rows)
+        return summary_df
+
     if uploaded_peak_excel is not None:
         with st.spinner("กำลังตรวจสอบไฟล์ Excel..."):
             try:
@@ -2401,33 +2471,222 @@ def render_receipt_bot_page():
                     df_peak = pd.read_excel(excel_file, sheet_name="ข้อมูลพร้อม DBD")
                     st.success("✅ โหลดข้อมูลจากชีต 'ข้อมูลพร้อม DBD' สำเร็จ!")
 
-                    # เก็บข้อมูลไว้ใน session state สำหรับขั้นตอนถัดไป
-                    st.session_state["peakengine_source_df"] = df_peak
-                    st.session_state["peakengine_source_filename"] = getattr(uploaded_peak_excel, "name", "uploaded.xlsx")
+                    available_company_cols = [col for col in df_peak.columns if "ชื่อบริษัท" in str(col)]
+                    transfer_type_col = next((col for col in df_peak.columns if "ประเภทผู้ส่งโอน" in str(col)), None)
+
+                    df_peak_filtered = df_peak.copy()
+                    selected_transfer_types_state: List[str] = st.session_state.get("peakengine_selected_transfer_types", [])
+
+                    if transfer_type_col:
+                        st.subheader("🎯 เลือกประเภทผู้ส่งโอนสำหรับประมวลผล")
+                        transfer_series = df_peak[transfer_type_col].astype(str).str.strip()
+                        transfer_series = transfer_series[~transfer_series.str.lower().eq("nan")]
+                        unique_transfer_types = sorted([value for value in transfer_series.unique().tolist() if value])
+
+                        if unique_transfer_types:
+                            default_selection = [value for value in selected_transfer_types_state if value in unique_transfer_types]
+                            if not default_selection:
+                                default_selection = unique_transfer_types
+
+                            selected_transfer_types = st.multiselect(
+                                "เลือกประเภทผู้ส่งโอนที่จะให้ระบบทำงาน:",
+                                unique_transfer_types,
+                                default=default_selection,
+                                help="เลือกประเภทผู้ส่งโอนที่ต้องการให้ระบบทำงานเฉพาะรายการนั้นๆ",
+                                key="peakengine_transfer_type_multiselect"
+                            )
+
+                            st.session_state["peakengine_selected_transfer_types"] = selected_transfer_types
+
+                            if selected_transfer_types:
+                                filtered_mask = transfer_series.isin(selected_transfer_types)
+                                df_peak_filtered = df_peak[filtered_mask].copy()
+                                st.info(
+                                    f"📌 เลือก {len(selected_transfer_types)} ประเภทผู้ส่งโอน • รายการที่ใช้ประมวลผล {len(df_peak_filtered)} จาก {len(df_peak)} แถว",
+                                    icon="📊"
+                                )
+                            else:
+                                df_peak_filtered = df_peak.iloc[0:0].copy()
+                                st.warning("⚠️ ยังไม่ได้เลือกประเภทผู้ส่งโอน ระบบจะยังไม่ประมวลผลข้อมูลจากไฟล์นี้")
+                        else:
+                            st.info("ℹ️ ไม่พบค่าประเภทผู้ส่งโอนในไฟล์ Excel นี้", icon="ℹ️")
+                            st.session_state["peakengine_selected_transfer_types"] = []
+                    else:
+                        st.info("ℹ️ ไม่พบคอลัมน์ 'ประเภทผู้ส่งโอน' ในไฟล์นี้ จึงไม่สามารถเลือกแยกการทำงานได้", icon="ℹ️")
+                        st.session_state["peakengine_selected_transfer_types"] = []
+
+                    st.session_state["peakengine_transfer_type_column"] = transfer_type_col
 
                     st.subheader("📊 สรุปข้อมูลจากไฟล์")
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.metric("จำนวนแถวทั้งหมด", len(df_peak))
                     with col2:
-                        st.metric("จำนวนคอลัมน์", len(df_peak.columns))
+                        st.metric("จำนวนแถวที่เลือก", len(df_peak_filtered))
                     with col3:
-                        available_company_cols = [col for col in df_peak.columns if "ชื่อบริษัท" in str(col)]
                         st.metric("คอลัมน์ชื่อบริษัทที่พบ", len(available_company_cols))
 
                     st.write("**คอลัมน์ทั้งหมดในชีต:**")
                     st.write(", ".join(df_peak.columns.astype(str).tolist()) or "-")
 
                     st.subheader("🔍 ตัวอย่างข้อมูล (5 แถวแรก)")
-                    st.dataframe(df_peak.head(5), use_container_width=True)
+                    if df_peak_filtered.empty:
+                        st.warning("⚠️ ไม่มีข้อมูลหลังจากใช้งานตัวกรองประเภทผู้ส่งโอน")
+                    else:
+                        st.dataframe(df_peak_filtered.head(5), use_container_width=True)
 
                     if available_company_cols:
                         st.caption(f"🎯 จะใช้คอลัมน์เหล่านี้ในการกรอกข้อมูล: {', '.join(available_company_cols)}")
                     else:
                         st.warning("⚠️ ไม่พบคอลัมน์ที่มีคำว่า 'ชื่อบริษัท' ภายในหัวคอลัมน์ โปรดตรวจสอบไฟล์")
 
+                    # เก็บข้อมูลไว้ใน session state สำหรับขั้นตอนถัดไป
+                    def classify_dbd_status(value: Any) -> str:
+                        if value is None:
+                            return "ค่าว่าง"
+                        if isinstance(value, float) and pd.isna(value):
+                            return "ค่าว่าง"
+                        text = str(value).strip()
+                        lower_text = text.lower()
+                        if not text or lower_text in {"nan", "none", ""}:
+                            return "ค่าว่าง"
+                        if "ไม่พบ" in lower_text or "ไม่มีข้อมูล" in lower_text:
+                            return "ไม่มีข้อมูล"
+                        if "ข้อผิดพลาด" in lower_text or "error" in lower_text:
+                            return "ข้อผิดพลาด"
+                        if "มีข้อมูล" in lower_text or "พบข้อมูล" in lower_text:
+                            return "มีข้อมูล"
+                        return "มีข้อมูล"
+
+                    if not df_peak_filtered.empty:
+                        df_peak_filtered = df_peak_filtered.copy()
+                        df_peak_filtered.loc[:, "สถานะข้อมูล DBD"] = df_peak_filtered["ข้อมูล DBD"].apply(classify_dbd_status)
+                        status_counts = df_peak_filtered["สถานะข้อมูล DBD"].value_counts()
+                        st.subheader("📊 สถานะข้อมูล DBD")
+                        col_status = st.columns(len(status_counts) if status_counts.size else 1)
+                        for idx, (status_label, count_value) in enumerate(status_counts.items()):
+                            with col_status[idx]:
+                                st.metric(status_label, count_value)
+
+                        with st.expander("🗂️ ดูข้อมูลตามสถานะ", expanded=False):
+                            available_statuses = sorted(df_peak_filtered["สถานะข้อมูล DBD"].unique().tolist())
+                            default_status_filter = st.session_state.get("peakengine_status_filter", available_statuses)
+                            default_status_filter = [status for status in default_status_filter if status in available_statuses]
+                            if not default_status_filter:
+                                default_status_filter = available_statuses
+
+                            status_filter = st.multiselect(
+                                "เลือกสถานะข้อมูล DBD ที่ต้องการแสดง",
+                                options=available_statuses,
+                                default=default_status_filter,
+                                help="กรองข้อมูลตามสถานะจากคอลัมน์ 'ข้อมูล DBD'",
+                                key="peakengine_status_filter"
+                            )
+
+                            search_keyword = st.text_input(
+                                "ค้นหาชื่อบริษัท/คำสำคัญ",
+                                value=st.session_state.get("peakengine_status_search", ""),
+                                help="พิมพ์คำค้นหาที่ต้องการ เช่น ชื่อบริษัท เลขทะเบียน หรือคำอื่นๆ",
+                                key="peakengine_status_search"
+                            )
+
+                            max_rows = st.number_input(
+                                "จำนวนแถวที่ต้องการแสดง",
+                                min_value=10,
+                                max_value=max(10, len(df_peak_filtered)),
+                                value=min(100, max(10, len(df_peak_filtered))),
+                                step=10,
+                                help="จำกัดจำนวนแถวที่แสดงเพื่อความสะดวกในการตรวจสอบ"
+                            )
+
+                            filtered_view = df_peak_filtered.copy()
+                            if status_filter:
+                                filtered_view = filtered_view[filtered_view["สถานะข้อมูล DBD"].isin(status_filter)]
+
+                            if search_keyword:
+                                keyword = search_keyword.strip().lower()
+                                if keyword:
+                                    mask = (
+                                        filtered_view["ข้อมูล DBD"].astype(str).str.lower().str.contains(keyword, na=False)
+                                        | filtered_view["ชื่อบริษัทจาก DBD"].astype(str).str.lower().str.contains(keyword, na=False)
+                                        | filtered_view["ชื่อบริษัท/บุคคล"].astype(str).str.lower().str.contains(keyword, na=False)
+                                    )
+                                    filtered_view = filtered_view[mask]
+
+                            st.write(f"พบ {len(filtered_view)} รายการ (จากทั้งหมด {len(df_peak_filtered)})")
+
+                            if filtered_view.empty:
+                                st.info("ไม่พบข้อมูลตามเงื่อนไขที่เลือก")
+                            else:
+                                st.dataframe(
+                                    filtered_view.head(int(max_rows)),
+                                    use_container_width=True
+                                )
+
+                    st.session_state["peakengine_source_df_full"] = df_peak
+                    st.session_state["peakengine_source_df"] = df_peak_filtered
+                    st.session_state["peakengine_source_filename"] = getattr(uploaded_peak_excel, "name", "uploaded.xlsx")
+
+                    if transfer_type_col and not df_peak.empty:
+                        st.subheader("💾 ดาวน์โหลดข้อมูลตามประเภทผู้ส่งโอน (ข้อมูลพร้อม DBD)")
+                        st.caption("รวมทุกแถวจากชีต 'ข้อมูลพร้อม DBD' ของประเภทที่เลือกไว้ พร้อมข้อมูล DBD ครบถ้วน (รวมรายการที่ยอดไม่เป็นบวกหรือไม่พบข้อมูล)")
+
+                        transfer_series_full = df_peak[transfer_type_col].astype(str).str.strip()
+                        transfer_series_full = transfer_series_full[~transfer_series_full.str.lower().eq("nan")]
+                        available_export_types = sorted([value for value in transfer_series_full.unique().tolist() if value])
+
+                        if available_export_types:
+                            export_datasets_step1: List[Tuple[str, bytes, str]] = []
+                            timestamp_step1 = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            zip_buffer_step1 = io.BytesIO()
+
+                            with zipfile.ZipFile(zip_buffer_step1, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                                for type_value in available_export_types:
+                                    type_mask_full = transfer_series_full == type_value
+                                    type_df_full = df_peak[type_mask_full].copy()
+                                    if type_df_full.empty:
+                                        continue
+
+                                    excel_buffer = io.BytesIO()
+                                    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                                        type_df_full.to_excel(writer, sheet_name="ข้อมูลพร้อม DBD", index=False)
+                                    excel_buffer.seek(0)
+
+                                    safe_type_name = slugify_filename(type_value)
+                                    excel_filename = f"ข้อมูลพร้อมDBD_{safe_type_name}_{timestamp_step1}.xlsx"
+
+                                    zip_file.writestr(excel_filename, excel_buffer.getvalue())
+                                    export_datasets_step1.append((type_value, excel_buffer.getvalue(), excel_filename))
+
+                            if export_datasets_step1:
+                                zip_buffer_step1.seek(0)
+                                st.download_button(
+                                    label="📦 ดาวน์โหลดทุกประเภทเป็น ZIP (ข้อมูลพร้อม DBD)",
+                                    data=zip_buffer_step1.getvalue(),
+                                    file_name=f"ข้อมูลพร้อมDBD_ตามประเภท_{timestamp_step1}.zip",
+                                    mime="application/zip",
+                                    key="download_step1_zip_all"
+                                )
+
+                                st.caption("หรือดาวน์โหลดเฉพาะประเภทที่สนใจ:")
+                                num_cols_step1 = min(3, len(export_datasets_step1))
+                                cols_step1 = st.columns(num_cols_step1)
+
+                                for idx_export, (type_value, excel_bytes, excel_filename) in enumerate(export_datasets_step1):
+                                    target_col = cols_step1[idx_export % num_cols_step1]
+                                    with target_col:
+                                        st.download_button(
+                                            label=f"📥 ดาวน์โหลด {type_value}",
+                                            data=excel_bytes,
+                                            file_name=excel_filename,
+                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                            key=f"download_step1_{slugify_filename(f'{type_value}_{idx_export}')}"
+                                        )
+                        else:
+                            st.info("ไม่พบข้อมูลประเภทผู้ส่งโอนสำหรับดาวน์โหลด", icon="ℹ️")
+
                     reg_info_map: Dict[str, Dict[str, Any]] = {}
-                    for idx_row, row in df_peak.iterrows():
+                    for idx_row, row in df_peak_filtered.iterrows():
                         dbd_raw = row.get("ข้อมูล DBD", "")
                         dbd_parsed = parse_dbd_info(dbd_raw)
                         reg_candidate = (
@@ -2445,24 +2704,50 @@ def render_receipt_bot_page():
                             "dbd_raw": dbd_raw,
                             "dbd_info": dbd_parsed,
                             "transfer_type": str(row.get("ประเภทผู้ส่งโอน", "")).strip(),
+                            "dbd_status": row.get("สถานะข้อมูล DBD", ""),
                             "company_name": row.get("ชื่อบริษัทจาก DBD", ""),
                             "row_index": int(idx_row),
                             "row": row_dict
                         }
                     st.session_state["peakengine_reg_info_map"] = reg_info_map
 
+                    summary_df: Optional[pd.DataFrame] = None
+                    summary_title = "📑 สรุปข้อมูล DBD"
+                    summary_caption = ""
+
                     if "สรุปข้อมูล DBD" in excel_file.sheet_names:
-                        df_summary = pd.read_excel(excel_file, sheet_name="สรุปข้อมูล DBD")
+                        try:
+                            df_summary = pd.read_excel(excel_file, sheet_name="สรุปข้อมูล DBD")
 
-                        if "เลขทะเบียน" in df_summary.columns:
-                            df_summary["เลขทะเบียน_พร้อมใช้งาน"] = df_summary["เลขทะเบียน"].apply(normalize_registration_number)
-                        else:
-                            df_summary["เลขทะเบียน_พร้อมใช้งาน"] = ""
+                            if "เลขทะเบียน" in df_summary.columns:
+                                df_summary["เลขทะเบียน_พร้อมใช้งาน"] = df_summary["เลขทะเบียน"].apply(normalize_registration_number)
+                            else:
+                                df_summary["เลขทะเบียน_พร้อมใช้งาน"] = ""
 
-                        st.session_state["peakengine_summary_df"] = df_summary
-                        st.subheader("📑 สรุปข้อมูล DBD")
+                            selected_transfer_types_summary = st.session_state.get("peakengine_selected_transfer_types", [])
+                            if transfer_type_col and selected_transfer_types_summary and transfer_type_col in df_summary.columns:
+                                summary_type_series = df_summary[transfer_type_col].astype(str).str.strip()
+                                summary_mask = summary_type_series.isin(selected_transfer_types_summary)
+                                df_summary = df_summary[summary_mask].copy()
+                                if df_summary.empty:
+                                    st.warning("⚠️ ไม่มีข้อมูลในชีต 'สรุปข้อมูล DBD' ที่ตรงกับประเภทผู้ส่งโอนที่เลือก")
 
-                        reg_series = df_summary.get("เลขทะเบียน_พร้อมใช้งาน", df_summary.get("เลขทะเบียน"))
+                            summary_df = df_summary if not df_summary.empty else None
+                        except Exception as summary_error:
+                            st.warning(f"⚠️ อ่านชีต 'สรุปข้อมูล DBD' ไม่สำเร็จ: {summary_error}")
+
+                    if summary_df is None or summary_df.empty:
+                        summary_df = build_summary_from_source(df_peak_filtered)
+                        summary_title = "📑 สรุปเลขทะเบียนจากข้อมูลพร้อม DBD"
+                        summary_caption = "⚠️ ใช้ข้อมูลจากชีต 'ข้อมูลพร้อม DBD' แทน เนื่องจากไม่พบหรือไม่สามารถใช้ชีต 'สรุปข้อมูล DBD'"
+
+                    if summary_df is not None and not summary_df.empty:
+                        st.session_state["peakengine_summary_df"] = summary_df
+                        st.subheader(summary_title)
+                        if summary_caption:
+                            st.caption(summary_caption)
+
+                        reg_series = summary_df.get("เลขทะเบียน_พร้อมใช้งาน", summary_df.get("เลขทะเบียน"))
                         valid_reg = []
                         if reg_series is not None:
                             reg_series = reg_series.astype(str).str.strip()
@@ -2470,20 +2755,21 @@ def render_receipt_bot_page():
 
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("จำนวนแถว (สรุป)", len(df_summary))
+                            st.metric("จำนวนแถวในสรุป", len(summary_df))
                         with col2:
                             st.metric("จำนวนเลขทะเบียนที่ไม่ว่าง", len(valid_reg))
                         with col3:
                             unique_regs = list(dict.fromkeys(valid_reg))
                             st.metric("เลขทะเบียนไม่ซ้ำ", len(unique_regs))
 
-                        st.write("**คอลัมน์ใน 'สรุปข้อมูล DBD':**")
-                        st.write(", ".join(df_summary.columns.astype(str).tolist()) or "-")
+                        st.write("**คอลัมน์ในข้อมูลสรุป:**")
+                        st.write(", ".join(summary_df.columns.astype(str).tolist()) or "-")
 
-                        st.subheader("🔍 ตัวอย่างจาก 'สรุปข้อมูล DBD' (5 แถวแรก)")
-                        st.dataframe(df_summary.head(5), use_container_width=True)
+                        st.subheader("🔍 ตัวอย่างข้อมูลสรุป (5 แถวแรก)")
+                        st.dataframe(summary_df.head(5), use_container_width=True)
                     else:
-                        st.warning("⚠️ ไม่พบชีต 'สรุปข้อมูล DBD' ในไฟล์นี้ ระบบจะไม่สามารถเตรียมเลขทะเบียนสำหรับกรอกผู้ติดต่อได้")
+                        st.error("❌ ไม่พบเลขทะเบียนที่สามารถใช้งานได้จากไฟล์นี้")
+                        st.session_state["peakengine_summary_df"] = pd.DataFrame()
 
             except Exception as e:
                 st.error(f"❌ เกิดข้อผิดพลาดในการอ่านไฟล์ Excel: {str(e)}")
@@ -2504,177 +2790,1161 @@ def render_receipt_bot_page():
         registration_numbers = [reg for reg in reg_series if reg and reg.lower() != "nan"]
         unique_registration_numbers = list(dict.fromkeys(registration_numbers))
 
+        df_source_for_filters = st.session_state.get("peakengine_source_df", pd.DataFrame())
+
+        def normalize_status_value(raw_status: Any) -> str:
+            text = str(raw_status).strip()
+            lower_text = text.lower()
+            if not text or lower_text in {"nan", "none", ""}:
+                return "ค่าว่าง"
+            if "ไม่พบ" in lower_text or "ไม่มีข้อมูล" in lower_text:
+                return "ไม่มีข้อมูล"
+            if "ข้อผิดพลาด" in lower_text or "error" in lower_text:
+                return "ข้อผิดพลาด"
+            if "มีข้อมูล" in lower_text or "พบข้อมูล" in lower_text:
+                return "มีข้อมูล"
+            return text
+
+        def normalize_transfer_type(raw_type: Any) -> str:
+            text = str(raw_type).strip()
+            lower_text = text.lower()
+            if not text or lower_text in {"nan", "none", "-", ""}:
+                return "-"
+            replacements = {
+                "บริษัท(บจก.)": "บริษัท (บจก.)",
+                "บริษัท(บจก)": "บริษัท (บจก.)",
+                "บริษัท (บจก)": "บริษัท (บจก.)",
+                "บริษัท จำกัด": "บริษัท (บจก.)",
+                "บริษัท": "บริษัท (บจก.)",
+                "บุคคล": "บุคคล",
+                "หจก.": "ห้างหุ้นส่วน (หจก.)",
+                "ห้างหุ้นส่วนจำกัด": "ห้างหุ้นส่วน (หจก.)",
+                "ห้างหุ้นส่วน": "ห้างหุ้นส่วน (หจก.)"
+            }
+            normalized = replacements.get(text, replacements.get(lower_text, text))
+            return normalized
+
+        def format_amount_display(raw_amount: Any, fallback_numeric: Optional[float]) -> str:
+            if isinstance(raw_amount, (int, float)) and not pd.isna(raw_amount):
+                return f"{float(raw_amount):,.2f}"
+            if isinstance(raw_amount, str):
+                amount_str = raw_amount.strip()
+                if amount_str.lower() in {"nan", "none", ""}:
+                    pass
+                else:
+                    return amount_str
+            if fallback_numeric is not None:
+                return f"{fallback_numeric:,.2f}"
+            return "-"
+
+        def format_date_display(raw_date: Any) -> str:
+            if raw_date is None:
+                return "-"
+            if isinstance(raw_date, pd.Timestamp):
+                try:
+                    return raw_date.to_pydatetime().strftime("%d/%m/%Y")
+                except Exception:
+                    return raw_date.strftime("%d/%m/%Y")
+            if isinstance(raw_date, datetime):
+                return raw_date.strftime("%d/%m/%Y")
+            if isinstance(raw_date, (int, float)):
+                try:
+                    if pd.isna(raw_date):
+                        return "-"
+                except Exception:
+                    pass
+                try:
+                    base_date = datetime(1899, 12, 30)
+                    converted = base_date + timedelta(days=float(raw_date))
+                    return converted.strftime("%d/%m/%Y")
+                except Exception:
+                    pass
+            text = str(raw_date).strip()
+            if not text or text.lower() in {"nan", "none", "-", "--"}:
+                return "-"
+            normalized_text = text.replace("T", " ").split("+", 1)[0].strip()
+            date_formats = [
+                "%d/%m/%Y",
+                "%d-%m-%Y",
+                "%Y-%m-%d",
+                "%Y/%m/%d",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M",
+                "%d-%m-%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M",
+                "%d %b %Y",
+                "%d %b %y"
+            ]
+            for fmt in date_formats:
+                try:
+                    dt = datetime.strptime(normalized_text, fmt)
+                    return dt.strftime("%d/%m/%Y")
+                except Exception:
+                    continue
+            if " " in normalized_text:
+                primary = normalized_text.split(" ", 1)[0].strip()
+                if primary and primary != normalized_text:
+                    formatted_primary = format_date_display(primary)
+                    if formatted_primary and formatted_primary != "-":
+                        return formatted_primary
+            return normalized_text
+
+        def get_row_amount(row_data: pd.Series) -> Optional[float]:
+            amount_value = row_data.get("ยอดเงิน_numeric")
+            if amount_value is not None and not (isinstance(amount_value, float) and pd.isna(amount_value)):
+                try:
+                    return float(amount_value)
+                except (TypeError, ValueError):
+                    pass
+
+            raw_amount = row_data.get("จำนวนเงิน")
+            if raw_amount is None:
+                return None
+
+            text_amount = str(raw_amount).strip()
+            if not text_amount or text_amount.lower() in {"nan", "none"}:
+                return None
+
+            negative = False
+            if text_amount.startswith("(") and text_amount.endswith(")"):
+                negative = True
+                text_amount = text_amount[1:-1]
+
+            text_amount = text_amount.replace(",", "").replace("+", "").strip()
+            if not text_amount:
+                return None
+
+            try:
+                value = float(text_amount)
+                return -value if negative else value
+            except ValueError:
+                return None
+
+        def normalize_company_key(raw_name: Any) -> str:
+            if raw_name is None:
+                return ""
+            text = str(raw_name).strip().lower()
+            if not text or text in {"nan", "none", ""}:
+                return ""
+            replacements = [
+                "บริษัทจำกัด", "บริษัท จำกัด", "บริษัท(จำกัด)", "บริษัท (จำกัด)",
+                "บริษัท(บจก.)", "บริษัท (บจก.)", "บริษัทจำกัด (มหาชน)", "บริษัทมหาชนจำกัด",
+                "บริษัท", "บจก.", "บจก", "จำกัด", "มหาชน",
+                "ห้างหุ้นส่วนจำกัด", "ห้างหุ้นส่วน", "หจก.", "หจก"
+            ]
+            for phrase in replacements:
+                text = text.replace(phrase.lower(), "")
+            text = re.sub(r"[^\wก-๙]+", "", text)
+            return text
+
+        def clean_text(value: Any) -> str:
+            if value is None:
+                return ""
+            text = str(value).strip()
+            if not text or text.lower() in {"nan", "none"}:
+                return ""
+            return text
+
+        def pick_first_text(*values: Any) -> str:
+            for value in values:
+                text = clean_text(value)
+                if text:
+                    return text
+            return ""
+
+        summary_df_for_lookup = st.session_state.get("peakengine_summary_df")
+        summary_lookup: Dict[str, Dict[str, Any]] = {}
+        if summary_df_for_lookup is not None and not summary_df_for_lookup.empty:
+            for _, summary_row in summary_df_for_lookup.iterrows():
+                reg_candidates = [
+                    summary_row.get("เลขทะเบียน_พร้อมใช้งาน"),
+                    summary_row.get("เลขทะเบียน")
+                ]
+                normalized_reg = ""
+                for candidate in reg_candidates:
+                    normalized_reg = normalize_registration_number(candidate)
+                    if normalized_reg:
+                        break
+                if not normalized_reg:
+                    continue
+                summary_data_dict = summary_row.to_dict()
+                potential_names = []
+                for col_name in [
+                    "ชื่อบริษัทจาก DBD",
+                    "ชื่อบริษัท",
+                    "ชื่อบริษัท/บุคคล",
+                    "ชื่อบริษัท (ไฟล์ต้นทาง)",
+                    "CompanyName"
+                ]:
+                    if col_name in summary_row and pd.notna(summary_row[col_name]):
+                        potential_names.append(summary_row[col_name])
+                for name in potential_names:
+                    key = normalize_company_key(name)
+                    if key and key not in summary_lookup:
+                        summary_lookup[key] = {
+                            "registration": normalized_reg,
+                            "data": summary_data_dict
+                        }
+
+        positive_rows: List[Dict[str, Any]] = []
+        if df_source_for_filters is not None and not df_source_for_filters.empty:
+            for idx, row in df_source_for_filters.iterrows():
+                amount_numeric = get_row_amount(row)
+                if amount_numeric is None or amount_numeric <= 0:
+                    continue
+
+                dbd_info_raw_value = clean_text(row.get("ข้อมูล DBD", "")) or str(row.get("ข้อมูล DBD", "")).strip()
+                dbd_info_dict = parse_dbd_info(dbd_info_raw_value)
+
+                reg_candidate = (
+                    row.get("เลขทะเบียน")
+                    or row.get("เลขทะเบียนจาก DBD")
+                    or row.get("เลขทะเบียนนิติบุคคล")
+                    or dbd_info_dict.get("เลขทะเบียน")
+                )
+                reg_norm = normalize_registration_number(reg_candidate)
+
+                status_value = normalize_status_value(row.get("สถานะข้อมูล DBD", ""))
+
+                transfer_type_value = normalize_transfer_type(row.get("ประเภทผู้ส่งโอน", ""))
+
+                company_value_raw = (
+                    row.get("ชื่อบริษัทจาก DBD")
+                    or row.get("ชื่อบริษัท/บุคคล")
+                    or row.get("ชื่อบริษัท")
+                    or ""
+                )
+                company_value = str(company_value_raw).strip() or "-"
+
+                work_category_raw = row.get("ประเภทการทำงาน")
+                work_category_value = clean_text(work_category_raw) or "-"
+                normalized_work_category = work_category_value.strip().lower()
+                skip_work_categories = {"", "-", "ไม่มีประเภทงาน", "เปิดบิลแล้ว", "เปิดบิลเอง", "บอทไม่ทำงาน"}
+                valid_work_categories = {"ภาษีปกติ", "หัก ณ ที่จ่าย"}
+
+                if normalized_work_category in skip_work_categories:
+                    continue
+                if normalized_work_category and normalized_work_category not in valid_work_categories:
+                    st.warning(
+                        f"⚠️ พบประเภทการทำงานที่ไม่รองรับ: '{work_category_value}' (แถวที่ {idx + 2}) รายการนี้จะถูกข้าม",
+                        icon="⚠️"
+                    )
+                    continue
+
+                raw_date_value = row.get("วันที่")
+                date_value = format_date_display(raw_date_value)
+
+                amount_display = format_amount_display(row.get("จำนวนเงิน"), amount_numeric)
+
+                description_value_raw = str(row.get("คำอธิบาย", "")).strip()
+                description_value = description_value_raw if description_value_raw.lower() not in {"nan", "none", ""} else "-"
+
+                # DBD detail fields
+                dbd_company_name = pick_first_text(
+                    row.get("ชื่อบริษัทจาก DBD"),
+                    dbd_info_dict.get("ชื่อบริษัท"),
+                    dbd_info_dict.get("ชื่อกิจการ")
+                )
+                dbd_registration_text = pick_first_text(
+                    row.get("เลขทะเบียนจาก DBD"),
+                    row.get("เลขทะเบียน"),
+                    row.get("เลขทะเบียนนิติบุคคล"),
+                    dbd_info_dict.get("เลขทะเบียน")
+                )
+                dbd_business_type = pick_first_text(
+                    row.get("ประเภทธุรกิจจาก DBD"),
+                    row.get("ประเภทธุรกิจ"),
+                    dbd_info_dict.get("ประเภทธุรกิจ")
+                )
+                dbd_status_detail = pick_first_text(
+                    row.get("สถานะกิจการจาก DBD"),
+                    row.get("สถานะกิจการ"),
+                    dbd_info_dict.get("สถานะ")
+                )
+                dbd_capital = pick_first_text(
+                    row.get("ทุนจดทะเบียนจาก DBD"),
+                    row.get("ทุนจดทะเบียน"),
+                    dbd_info_dict.get("ทุนจดทะเบียน")
+                )
+                dbd_address_text = pick_first_text(
+                    row.get("ที่อยู่จาก DBD"),
+                    dbd_info_dict.get("ที่อยู่")
+                )
+                dbd_address_house_no = clean_text(row.get("ที่อยู่_บ้านเลขที่"))
+                dbd_address_village = clean_text(row.get("ที่อยู่_หมู่บ้าน"))
+                dbd_address_moo = clean_text(row.get("ที่อยู่_หมู่ที่"))
+                dbd_address_subdistrict = clean_text(row.get("ที่อยู่_ตำบล"))
+                dbd_address_district = clean_text(row.get("ที่อยู่_อำเภอ"))
+                dbd_address_province = clean_text(row.get("ที่อยู่_จังหวัด"))
+                dbd_address_postal_code = clean_text(row.get("ที่อยู่_รหัสไปรษณีย์"))
+
+                summary_match: Optional[Dict[str, Any]] = None
+                if transfer_type_value in {"บริษัท (บจก.)", "ห้างหุ้นส่วน (หจก.)"} and summary_lookup:
+                    candidate_names = [
+                        row.get("ชื่อบริษัทจาก DBD", ""),
+                        row.get("ชื่อบริษัท/บุคคล", ""),
+                        row.get("ชื่อบริษัท", ""),
+                        company_value,
+                        description_value
+                    ]
+                    for candidate_name in candidate_names:
+                        key = normalize_company_key(candidate_name)
+                        if key and key in summary_lookup:
+                            summary_match = summary_lookup[key]
+                            break
+
+                if summary_match:
+                    summary_data = summary_match["data"]
+                    if not reg_norm:
+                        reg_from_summary = summary_match.get("registration")
+                        reg_norm = normalize_registration_number(reg_from_summary) or reg_norm
+
+                    dbd_company_name = dbd_company_name or pick_first_text(
+                        summary_data.get("ชื่อบริษัทจาก DBD"),
+                        summary_data.get("ชื่อบริษัท")
+                    )
+                    dbd_registration_text = dbd_registration_text or pick_first_text(
+                        summary_data.get("เลขทะเบียน_พร้อมใช้งาน"),
+                        summary_data.get("เลขทะเบียน")
+                    )
+                    dbd_business_type = dbd_business_type or pick_first_text(summary_data.get("ประเภทธุรกิจ"))
+                    dbd_status_detail = dbd_status_detail or pick_first_text(summary_data.get("สถานะ"))
+                    dbd_capital = dbd_capital or pick_first_text(summary_data.get("ทุนจดทะเบียน"))
+                    dbd_address_text = dbd_address_text or pick_first_text(summary_data.get("ที่อยู่"))
+                    dbd_address_house_no = dbd_address_house_no or clean_text(summary_data.get("ที่อยู่_บ้านเลขที่"))
+                    dbd_address_village = dbd_address_village or clean_text(summary_data.get("ที่อยู่_หมู่บ้าน"))
+                    dbd_address_moo = dbd_address_moo or clean_text(summary_data.get("ที่อยู่_หมู่ที่"))
+                    dbd_address_subdistrict = dbd_address_subdistrict or clean_text(summary_data.get("ที่อยู่_ตำบล"))
+                    dbd_address_district = dbd_address_district or clean_text(summary_data.get("ที่อยู่_อำเภอ"))
+                    dbd_address_province = dbd_address_province or clean_text(summary_data.get("ที่อยู่_จังหวัด"))
+                    dbd_address_postal_code = dbd_address_postal_code or clean_text(summary_data.get("ที่อยู่_รหัสไปรษณีย์"))
+
+                dbd_registration_numeric = normalize_registration_number(dbd_registration_text)
+                if not reg_norm:
+                    reg_norm = dbd_registration_numeric or reg_norm
+                if not reg_norm:
+                    continue
+
+                dbd_registration_display = pick_first_text(
+                    dbd_registration_text,
+                    dbd_info_dict.get("เลขทะเบียน"),
+                    row.get("เลขทะเบียนจาก DBD"),
+                    row.get("เลขทะเบียน"),
+                    row.get("เลขทะเบียนนิติบุคคล")
+                ) or "-"
+
+                row_unique_key = f"{idx}_{len(positive_rows)}"
+                positive_rows.append({
+                    "row_key": row_unique_key,
+                    "registration": reg_norm,
+                    "dbd_status": status_value,
+                    "transfer_type": transfer_type_value or "-",
+                    "company_name": company_value or "-",
+                    "document_date_raw": raw_date_value,
+                    "work_category": work_category_value,
+                    "date": date_value,
+                    "amount": amount_display,
+                    "amount_numeric": amount_numeric,
+                    "description": description_value,
+                    "dbd_info_raw": dbd_info_raw_value or "-",
+                    "dbd_company_name": dbd_company_name or "-",
+                    "dbd_registration": dbd_registration_display,
+                    "dbd_business_type": dbd_business_type or "-",
+                    "dbd_status_detail": dbd_status_detail or "-",
+                    "dbd_capital": dbd_capital or "-",
+                    "dbd_address_text": dbd_address_text or "-",
+                    "dbd_address_house_no": dbd_address_house_no or "-",
+                    "dbd_address_village": dbd_address_village or "-",
+                    "dbd_address_moo": dbd_address_moo or "-",
+                    "dbd_address_subdistrict": dbd_address_subdistrict or "-",
+                    "dbd_address_district": dbd_address_district or "-",
+                    "dbd_address_province": dbd_address_province or "-",
+                    "dbd_address_postal_code": dbd_address_postal_code or "-",
+                    "source_index": idx
+                })
+
+        if not positive_rows:
+            st.warning("⚠️ ไม่มีเลขทะเบียนที่มียอดเงินเป็นบวกพร้อมสำหรับขั้นตอนที่ 2")
+            return
+
+        df_positive_rows = pd.DataFrame(positive_rows)
+        total_positive = len(df_positive_rows)
+        unique_positive = df_positive_rows["registration"].nunique()
+
+        status_counts = df_positive_rows["dbd_status"].value_counts()
+        type_counts = df_positive_rows["transfer_type"].value_counts()
+
+        st.caption("สรุปรายการก่อนกรอง")
+        col_summary_left, col_summary_right = st.columns(2)
+        with col_summary_left:
+            st.metric("จำนวนแถว (ยอดบวก)", total_positive)
+            st.metric("เลขทะเบียนไม่ซ้ำ", unique_positive)
+        with col_summary_right:
+            st.write("**สถานะข้อมูล DBD**")
+            status_display_df = status_counts.rename_axis("สถานะ").reset_index(name="จำนวน")
+            st.dataframe(status_display_df, height=150, hide_index=True)
+        st.write("**ประเภทผู้ส่งโอน**")
+        type_display_df = type_counts.rename_axis("ประเภท").reset_index(name="จำนวน")
+        st.dataframe(type_display_df, height=150, hide_index=True)
+
+        all_possible_statuses = ["มีข้อมูล", "ไม่มีข้อมูล", "ค่าว่าง", "ข้อผิดพลาด"]
+        available_step2_statuses = sorted(
+            {status for status in df_positive_rows["dbd_status"].dropna().unique().tolist() if status} |
+            set(all_possible_statuses)
+        )
+
+        available_step2_types = sorted(
+            {type_value for type_value in df_positive_rows["transfer_type"].dropna().unique().tolist() if type_value and type_value != "-"}
+        )
+        if df_positive_rows["transfer_type"].isin(["-"]).any() and "-" not in available_step2_types:
+            available_step2_types.insert(0, "-")
+
+        st.subheader("⚙️ ตัวกรองสำหรับขั้นตอนที่ 2")
+
+        step1_status_pref = st.session_state.get("peakengine_status_filter", [])
+        normalized_step1_pref = [
+            status for status in step1_status_pref if status in available_step2_statuses
+        ]
+        snapshot_key = "peakengine_step1_status_filter_snapshot"
+        step1_snapshot = tuple(sorted(normalized_step1_pref))
+        previous_snapshot = st.session_state.get(snapshot_key)
+        if step1_snapshot != previous_snapshot:
+            st.session_state[snapshot_key] = step1_snapshot
+            st.session_state["peakengine_step2_status_filter"] = normalized_step1_pref or available_step2_statuses
+        elif "peakengine_step2_status_filter" not in st.session_state:
+            st.session_state["peakengine_step2_status_filter"] = normalized_step1_pref or available_step2_statuses
+
+        default_step2_status_filter = st.session_state.get("peakengine_step2_status_filter", available_step2_statuses)
+        default_step2_status_filter = [status for status in default_step2_status_filter if status in available_step2_statuses]
+        if not default_step2_status_filter:
+            default_step2_status_filter = available_step2_statuses
+
+        pending_status_filter = st.session_state.pop("peakengine_step2_status_filter_pending", None)
+        if pending_status_filter is not None:
+            st.session_state["peakengine_step2_status_filter"] = [status for status in pending_status_filter if status in available_step2_statuses]
+            st.experimental_rerun()
+
+        selected_step2_statuses = st.multiselect(
+            "เลือกสถานะข้อมูล DBD ที่ต้องการให้ระบบกรอก:",
+            options=available_step2_statuses,
+            default=default_step2_status_filter,
+            help="เลือกว่าอยากให้ระบบกรอกเฉพาะรายการที่มี/ไม่มีข้อมูล DBD หรือทั้งหมด",
+            key="peakengine_step2_status_filter"
+        )
+
+        col_status_btn1, col_status_btn2 = st.columns(2)
+        with col_status_btn1:
+            if st.button("เลือกสถานะทั้งหมด", key="step2_status_select_all"):
+                st.session_state["peakengine_step2_status_filter_pending"] = available_step2_statuses
+        with col_status_btn2:
+            if st.button("ล้างการเลือกสถานะ", key="step2_status_clear"):
+                st.session_state["peakengine_step2_status_filter_pending"] = []
+
+        default_step2_type_filter = st.session_state.get("peakengine_step2_type_filter", available_step2_types)
+        default_step2_type_filter = [type_value for type_value in default_step2_type_filter if type_value in available_step2_types]
+        if not default_step2_type_filter and available_step2_types:
+            default_step2_type_filter = available_step2_types
+
+        pending_type_filter = st.session_state.pop("peakengine_step2_type_filter_pending", None)
+        if pending_type_filter is not None:
+            st.session_state["peakengine_step2_type_filter"] = [value for value in pending_type_filter if value in available_step2_types]
+            st.experimental_rerun()
+
+        selected_step2_types = st.multiselect(
+            "เลือกประเภทผู้ส่งโอนที่จะให้ระบบกรอก:",
+            options=available_step2_types,
+            default=default_step2_type_filter,
+            help="กรองตามประเภทผู้ส่งโอนก่อนเริ่มบอท (ถ้าไม่เลือกจะใช้ทุกประเภท)",
+            key="peakengine_step2_type_filter"
+        )
+
+        if available_step2_types:
+            col_type_btn1, col_type_btn2 = st.columns(2)
+            with col_type_btn1:
+                if st.button("เลือกประเภททั้งหมด", key="step2_type_select_all"):
+                    st.session_state["peakengine_step2_type_filter_pending"] = available_step2_types
+            with col_type_btn2:
+                if st.button("ล้างการเลือกประเภท", key="step2_type_clear"):
+                    st.session_state["peakengine_step2_type_filter_pending"] = []
+
+        step2_search_keyword = st.text_input(
+            "ค้นหาเลขทะเบียนหรือชื่อบริษัท (ปล่อยว่างหากไม่ต้องการกรอง)",
+            value=st.session_state.get("peakengine_step2_search", ""),
+            key="peakengine_step2_search"
+        ).strip()
+
+        show_preview_step2 = st.checkbox(
+            "แสดงรายการที่จะประมวลผล (หลังกรอง)",
+            value=st.session_state.get("peakengine_step2_show_preview", False),
+            key="peakengine_step2_show_preview"
+        )
+
+        filter_mask = pd.Series(True, index=df_positive_rows.index)
+        if selected_step2_statuses:
+            normalized_selected = [
+                "ลูกค้าไม่ประสงค์ออกนาม" if status == "ไม่มีข้อมูล" else status
+                for status in selected_step2_statuses
+            ]
+            filter_mask &= (
+                df_positive_rows["dbd_status"].isin(selected_step2_statuses)
+                & ~df_positive_rows["dbd_status"].astype(str).str.contains("ไม่มีข้อมูล", na=False)
+            )
+
+        if selected_step2_types and available_step2_types:
+            filter_mask &= df_positive_rows["transfer_type"].isin(selected_step2_types)
+
+        if step2_search_keyword:
+            keyword_lower = step2_search_keyword.lower()
+            filter_mask &= (
+                df_positive_rows["registration"].str.contains(keyword_lower, case=False, na=False)
+                | df_positive_rows["company_name"].str.contains(keyword_lower, case=False, na=False)
+                | df_positive_rows["description"].str.contains(keyword_lower, case=False, na=False)
+            )
+
+        df_step2_filtered = df_positive_rows[filter_mask].copy().reset_index(drop=True)
+
+        if df_step2_filtered.empty:
+            st.warning("⚠️ ไม่มีเลขทะเบียนที่ตรงกับเงื่อนไขตัวกรองขั้นที่ 2")
+            return
+
+        if "row_key" in df_step2_filtered.columns:
+            df_step2_filtered["row_key"] = (
+                df_step2_filtered["row_key"]
+                .astype(str)
+                .fillna("")
+                .apply(lambda x: x.strip())
+            )
+            missing_row_mask = df_step2_filtered["row_key"].isin(["", "nan", "none", "None"])
+            if missing_row_mask.any():
+                for idx_masked, _ in df_step2_filtered[missing_row_mask].iterrows():
+                    df_step2_filtered.at[idx_masked, "row_key"] = f"row_{idx_masked}"
+        else:
+            df_step2_filtered["row_key"] = [f"row_{idx}" for idx in range(len(df_step2_filtered))]
+
+        raw_not_found_mask = df_step2_filtered.get("dbd_info_raw", df_step2_filtered["dbd_status"]).astype(str).str.contains("ไม่พบข้อมูล", case=False, na=False)
+        status_not_found_mask = df_step2_filtered["dbd_status"].astype(str).str.strip() == "ไม่มีข้อมูล"
+        not_found_mask = raw_not_found_mask | status_not_found_mask
+
+        company_display_series = df_step2_filtered["company_name"].astype(str).where(~not_found_mask, "ลูกค้าไม่ประสงค์ออกนาม")
+        status_display_series = df_step2_filtered["dbd_status"].astype(str).where(~not_found_mask, "ลูกค้าไม่ประสงค์ออกนาม")
+
+        df_step2_filtered["company_name_display"] = company_display_series
+        df_step2_filtered["dbd_status_display"] = status_display_series
+
+        filtered_total = len(df_step2_filtered)
+        filtered_unique_total = df_step2_filtered["registration"].nunique()
+
+        st.write(
+            f"📌 พบเลขทะเบียนยอดบวกทั้งหมด {total_positive} รายการ (ไม่ซ้ำ {unique_positive}) "
+            f"• หลังใช้ตัวกรองเหลือ {filtered_total} รายการ (ไม่ซ้ำ {filtered_unique_total})"
+        )
+
+        row_records = df_step2_filtered.to_dict("records")
+        row_keys = [record.get("row_key") for record in row_records]
+        registration_numbers = [record.get("registration") for record in row_records]
+        unique_registration_numbers = list(dict.fromkeys(registration_numbers))
+        row_key_map = {
+            record.get("row_key"): record for record in row_records if record.get("row_key") is not None
+        }
+
+        not_found_df = df_step2_filtered[not_found_mask].copy()
+        st.session_state["peakengine_step2_not_found_df"] = not_found_df
+        st.session_state["peakengine_step2_not_found_regs"] = not_found_df["registration"].tolist()
+        st.session_state["peakengine_step2_all_df"] = df_step2_filtered.copy()
+        st.session_state["peakengine_step2_row_records"] = row_records
+        st.session_state["peakengine_step2_row_key_map"] = row_key_map
+
+        export_columns = {
+            "registration": "เลขทะเบียน",
+            "company_name": "ชื่อบริษัท/บุคคล (เดิม)",
+            "company_name_display": "ชื่อบริษัท/บุคคล",
+            "work_category": "ประเภทการทำงาน",
+            "date": "วันที่",
+            "amount": "จำนวนเงิน",
+            "description": "คำอธิบาย",
+            "dbd_status": "สถานะข้อมูล DBD (เดิม)",
+            "dbd_status_display": "สถานะข้อมูล DBD",
+            "transfer_type": "ประเภทผู้ส่งโอน",
+            "dbd_company_name": "ชื่อบริษัทจาก DBD",
+            "dbd_registration": "เลขทะเบียนจาก DBD",
+            "dbd_business_type": "ประเภทธุรกิจ",
+            "dbd_status_detail": "สถานะกิจการ",
+            "dbd_capital": "ทุนจดทะเบียน",
+            "dbd_address_text": "ที่อยู่ (ข้อความ)",
+            "dbd_address_house_no": "ที่อยู่_บ้านเลขที่",
+            "dbd_address_village": "ที่อยู่_หมู่บ้าน",
+            "dbd_address_moo": "ที่อยู่_หมู่ที่",
+            "dbd_address_subdistrict": "ที่อยู่_ตำบล",
+            "dbd_address_district": "ที่อยู่_อำเภอ",
+            "dbd_address_province": "ที่อยู่_จังหวัด",
+            "dbd_address_postal_code": "ที่อยู่_รหัสไปรษณีย์",
+            "dbd_info_raw": "ข้อมูล DBD (ดิบ)"
+        }
+
+        download_types = [
+            value for value in df_step2_filtered["transfer_type"].dropna().unique().tolist()
+            if str(value).strip()
+        ]
+
+        if download_types:
+            st.subheader("💾 ดาวน์โหลดไฟล์แยกตามประเภทผู้ส่งโอน")
+            st.caption("รวมเฉพาะรายการที่ผ่านตัวกรองขั้นตอนที่ 2 ในแต่ละไฟล์")
+
+            export_datasets: List[Tuple[str, bytes, str]] = []
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_buffer = io.BytesIO()
+
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for type_value in sorted(download_types):
+                    type_df = df_step2_filtered[df_step2_filtered["transfer_type"] == type_value]
+                    if type_df.empty:
+                        continue
+
+                    export_df = type_df[list(export_columns.keys())].rename(columns=export_columns)
+
+                    excel_buffer = io.BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                        export_df.to_excel(writer, sheet_name="ข้อมูล", index=False)
+                    excel_buffer.seek(0)
+
+                    safe_type = slugify_filename(type_value)
+                    excel_filename = f"step2_{safe_type}_{timestamp_str}.xlsx"
+
+                    zip_file.writestr(excel_filename, excel_buffer.getvalue())
+                    export_datasets.append((type_value, excel_buffer.getvalue(), excel_filename))
+
+            if export_datasets:
+                zip_buffer.seek(0)
+                st.download_button(
+                    label="📦 ดาวน์โหลดทุกประเภทเป็นไฟล์ ZIP",
+                    data=zip_buffer.getvalue(),
+                    file_name=f"step2_transfer_types_{timestamp_str}.zip",
+                    mime="application/zip",
+                    key="download_step2_zip_all"
+                )
+
+                st.caption("หรือดาวน์โหลดเฉพาะประเภทที่ต้องการ:")
+                num_cols = min(3, len(export_datasets))
+                cols = st.columns(num_cols)
+
+                for idx, (type_value, excel_bytes, excel_filename) in enumerate(export_datasets):
+                    target_col = cols[idx % num_cols]
+                    with target_col:
+                        st.download_button(
+                            label=f"📥 ดาวน์โหลด {type_value}",
+                            data=excel_bytes,
+                            file_name=excel_filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"download_step2_{slugify_filename(f'{type_value}_{idx}')}"
+                        )
+
+        if show_preview_step2:
+            preview_columns = {
+                "registration": "เลขทะเบียน",
+                "company_name_display": "ชื่อบริษัท/บุคคล",
+                "work_category": "ประเภทการทำงาน",
+                "date": "วันที่",
+                "amount": "จำนวนเงิน",
+                "description": "คำอธิบาย",
+                "dbd_status_display": "สถานะข้อมูล DBD",
+                "transfer_type": "ประเภทผู้ส่งโอน"
+            }
+            preview_df = df_step2_filtered[list(preview_columns.keys())].rename(columns=preview_columns)
+            st.dataframe(
+                preview_df.reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.session_state["peakengine_step2_filtered_df"] = df_step2_filtered
+
+        existing_reg_info_map = st.session_state.get("peakengine_reg_info_map", {})
+        reg_info_map_updated: Dict[str, Dict[str, Any]] = dict(existing_reg_info_map)
+        row_payload_map: Dict[str, Dict[str, Any]] = {}
+
+        if not df_source_for_filters.empty:
+            for _, step2_row in df_step2_filtered.iterrows():
+                reg_value = step2_row.get("registration")
+                if not reg_value:
+                    continue
+
+                source_idx = step2_row.get("source_index")
+                base_series = None
+                if source_idx is not None and not (isinstance(source_idx, float) and pd.isna(source_idx)):
+                    try:
+                        base_series = df_source_for_filters.loc[source_idx]
+                    except KeyError:
+                        try:
+                            base_series = df_source_for_filters.iloc[int(source_idx)]
+                        except Exception:
+                            base_series = None
+
+                base_row_dict: Dict[str, Any] = {}
+                if base_series is not None:
+                    base_row_dict = base_series.to_dict()
+
+                dbd_raw_candidates = [
+                    base_row_dict.get("ข้อมูล DBD"),
+                    step2_row.get("dbd_info_raw"),
+                    existing_reg_info_map.get(reg_value, {}).get("dbd_raw")
+                ]
+                dbd_raw_text = pick_first_text(*dbd_raw_candidates) or ""
+                dbd_parsed = parse_dbd_info(dbd_raw_text)
+
+                combined_row: Dict[str, Any] = {}
+                combined_row.update(base_row_dict)
+
+                step2_row_dict = step2_row.to_dict()
+                for key, value in step2_row_dict.items():
+                    if key not in combined_row or not combined_row[key]:
+                        combined_row[key] = value
+
+                # Map step2-specific address columns back to original column names if missing
+                address_mapping = {
+                    "dbd_address_house_no": "ที่อยู่_บ้านเลขที่",
+                    "dbd_address_village": "ที่อยู่_หมู่บ้าน",
+                    "dbd_address_moo": "ที่อยู่_หมู่ที่",
+                    "dbd_address_subdistrict": "ที่อยู่_ตำบล",
+                    "dbd_address_district": "ที่อยู่_อำเภอ",
+                    "dbd_address_province": "ที่อยู่_จังหวัด",
+                    "dbd_address_postal_code": "ที่อยู่_รหัสไปรษณีย์"
+                }
+                for source_key, target_key in address_mapping.items():
+                    value = step2_row_dict.get(source_key)
+                    if value and (target_key not in combined_row or not combined_row[target_key]):
+                        combined_row[target_key] = value
+
+                if dbd_raw_text and ("ข้อมูล DBD" not in combined_row or not combined_row["ข้อมูล DBD"]):
+                    combined_row["ข้อมูล DBD"] = dbd_raw_text
+
+                if step2_row_dict.get("company_name_display"):
+                    combined_row.setdefault("ชื่อบริษัท/บุคคล", step2_row_dict.get("company_name_display"))
+                if step2_row_dict.get("work_category"):
+                    combined_row.setdefault("ประเภทการทำงาน", step2_row_dict.get("work_category"))
+                if step2_row_dict.get("document_date_raw") is not None:
+                    if "วันที่" not in combined_row or not combined_row.get("วันที่"):
+                        combined_row["วันที่"] = step2_row_dict.get("document_date_raw")
+                if step2_row_dict.get("amount_numeric") is not None and (
+                    "amount_numeric" not in combined_row or pd.isna(combined_row.get("amount_numeric"))
+                ):
+                    combined_row["amount_numeric"] = step2_row_dict.get("amount_numeric")
+                if step2_row_dict.get("amount") and (
+                    "amount" not in combined_row or not combined_row.get("amount")
+                ):
+                    combined_row["amount"] = step2_row_dict.get("amount")
+
+                if step2_row_dict.get("dbd_company_name") and (
+                    "ชื่อบริษัทจาก DBD" not in combined_row or not combined_row["ชื่อบริษัทจาก DBD"]
+                ):
+                    combined_row["ชื่อบริษัทจาก DBD"] = step2_row_dict.get("dbd_company_name")
+
+                if step2_row_dict.get("dbd_registration") and (
+                    "เลขทะเบียนจาก DBD" not in combined_row or not combined_row["เลขทะเบียนจาก DBD"]
+                ):
+                    combined_row["เลขทะเบียนจาก DBD"] = step2_row_dict.get("dbd_registration")
+
+                reg_entry = reg_info_map_updated.get(reg_value, {})
+                reg_entry.update({
+                    "registration": reg_value,
+                    "transfer_type": step2_row_dict.get("transfer_type") or reg_entry.get("transfer_type", ""),
+                    "dbd_status": step2_row_dict.get("dbd_status") or reg_entry.get("dbd_status", ""),
+                    "dbd_status_display": step2_row_dict.get("dbd_status_display") or reg_entry.get("dbd_status_display", step2_row_dict.get("dbd_status", "")),
+                    "company_name": step2_row_dict.get("company_name_display") or step2_row_dict.get("company_name") or reg_entry.get("company_name", ""),
+                    "company_name_display": step2_row_dict.get("company_name_display") or reg_entry.get("company_name_display", step2_row_dict.get("company_name")),
+                    "work_category": step2_row_dict.get("work_category") or reg_entry.get("work_category", ""),
+                    "document_date_raw": step2_row_dict.get("document_date_raw") if step2_row_dict.get("document_date_raw") is not None else reg_entry.get("document_date_raw"),
+                    "amount": step2_row_dict.get("amount") or reg_entry.get("amount", ""),
+                    "amount_numeric": step2_row_dict.get("amount_numeric") if step2_row_dict.get("amount_numeric") is not None else reg_entry.get("amount_numeric"),
+                    "dbd_raw": dbd_raw_text or reg_entry.get("dbd_raw", ""),
+                    "dbd_info": dbd_parsed or reg_entry.get("dbd_info", {}),
+                    "row_index": (
+                        int(source_idx) if source_idx is not None and not (isinstance(source_idx, float) and pd.isna(source_idx))
+                        else reg_entry.get("row_index")
+                    ),
+                    "row_key": step2_row_dict.get("row_key") or reg_entry.get("row_key"),
+                    "row": combined_row,
+                    "step2_row": step2_row_dict
+                })
+                reg_info_map_updated[reg_value] = reg_entry
+
+                row_key_value = step2_row_dict.get("row_key")
+                if row_key_value:
+                    row_payload_map[row_key_value] = {
+                        "registration": reg_value,
+                        "transfer_type": step2_row_dict.get("transfer_type") or reg_entry.get("transfer_type", ""),
+                        "dbd_status": step2_row_dict.get("dbd_status"),
+                        "dbd_status_display": step2_row_dict.get("dbd_status_display"),
+                        "company_name": reg_entry.get("company_name"),
+                        "company_name_display": reg_entry.get("company_name_display"),
+                        "work_category": step2_row_dict.get("work_category"),
+                        "document_date_raw": step2_row_dict.get("document_date_raw"),
+                        "amount": step2_row_dict.get("amount"),
+                        "amount_numeric": step2_row_dict.get("amount_numeric"),
+                        "dbd_raw": dbd_raw_text,
+                        "dbd_info": dbd_parsed,
+                        "row_index": (
+                            int(source_idx) if source_idx is not None and not (isinstance(source_idx, float) and pd.isna(source_idx))
+                            else reg_entry.get("row_index")
+                        ),
+                        "row": combined_row,
+                        "step2_row": step2_row_dict
+                    }
+
+        st.session_state["peakengine_reg_info_map"] = reg_info_map_updated
+        st.session_state["peakengine_row_payload_map"] = row_payload_map
+
         if not registration_numbers:
             st.warning("⚠️ ไม่มีเลขทะเบียนที่พร้อมสำหรับกรอก")
             return
 
-        processed_list = st.session_state.get("peakengine_processed_regs", [])
-        processed_set = set(processed_list)
-        pending_numbers = [reg for reg in registration_numbers for _ in [reg] if reg not in processed_set]
-        pending_unique_numbers = [reg for reg in unique_registration_numbers if reg not in processed_set]
+        run_summary_stats = {
+            "total_rows": filtered_total,
+            "unique_regs": filtered_unique_total,
+            "not_found_rows": 0,
+            "not_found_unique": 0
+        }
+        st.session_state["peakengine_run_summary_stats"] = run_summary_stats
+        st.session_state["peakengine_run_summary_snapshot"] = df_step2_filtered
 
-        st.write(f"📌 พบเลขทะเบียนทั้งหมด {len(registration_numbers)} รายการ (ไม่ซ้ำ {len(unique_registration_numbers)})")
+        summary_tab, runner_tab = st.tabs(["📊 สรุปข้อมูลสำหรับการรันบอท", "⚙️ ตั้งค่าการรันบอท"])
 
-        col_stats1, col_stats2, col_stats3 = st.columns(3)
-        with col_stats1:
-            st.metric("รายการที่กรอกแล้ว", len(processed_set))
-        with col_stats2:
-            st.metric("รายการที่เหลือ", len(pending_numbers))
-        with col_stats3:
-            st.metric("เลขทะเบียนที่เหลือ (ไม่ซ้ำ)", len(pending_unique_numbers))
+        with summary_tab:
+            col_summary_metrics = st.columns(3)
+            with col_summary_metrics[0]:
+                st.metric("รายการหลังกรอง", filtered_total)
+            with col_summary_metrics[1]:
+                st.metric("เลขทะเบียนไม่ซ้ำ", filtered_unique_total)
 
-        st.caption("เลือกโหมดการทำงาน: กรอกทีละรายการ หรือกรอกต่อเนื่องทุกเลขที่เหลือ")
+            status_distribution = df_step2_filtered["dbd_status_display"].value_counts().rename_axis("สถานะ").reset_index(name="จำนวน")
+            type_distribution = df_step2_filtered["transfer_type"].value_counts().rename_axis("ประเภทผู้ส่งโอน").reset_index(name="จำนวน")
 
-        fill_mode = st.radio(
-            "โหมดการกรอก:",
-            ["กรอกทีละรายการ", "กรอกต่อเนื่อง (ทั้งหมดที่เหลือ)"],
-            key="peak_fill_mode",
-            horizontal=True
-        )
+            st.write("**สัดส่วนสถานะข้อมูล DBD (หลังกรอง)**")
+            st.dataframe(status_distribution, use_container_width=True, hide_index=True)
 
-        selected_registration = None
-        if fill_mode == "กรอกทีละรายการ":
-            selected_registration = st.selectbox(
-                "เลือกเลขทะเบียนที่จะกรอก:",
-                pending_numbers if pending_numbers else registration_numbers,
-                index=0 if pending_numbers or registration_numbers else None,
-                key="selected_registration_number"
+            st.write("**สัดส่วนประเภทผู้ส่งโอน (หลังกรอง)**")
+            st.dataframe(type_distribution, use_container_width=True, hide_index=True)
+
+            with st.expander("ดูรายการที่ DBD ไม่พบข้อมูล", expanded=False):
+                if not not_found_df.empty:
+                    st.dataframe(
+                        not_found_df.reset_index(drop=True)[
+                            ["registration", "company_name_display", "work_category", "date", "amount", "description", "transfer_type", "dbd_info_raw"]
+                        ].rename(columns={
+                            "registration": "เลขทะเบียน",
+                            "company_name_display": "ชื่อบริษัท/บุคคล",
+                            "work_category": "ประเภทการทำงาน",
+                            "date": "วันที่",
+                            "amount": "จำนวนเงิน",
+                            "description": "คำอธิบาย",
+                            "transfer_type": "ประเภทผู้ส่งโอน",
+                            "dbd_info_raw": "ข้อมูล DBD"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("ไม่มีรายการที่ระบุว่า DBD ไม่พบข้อมูลในตัวกรองปัจจุบัน")
+
+            st.write("**ตัวอย่างรายการสำหรับบอท (20 แถวแรก)**")
+            st.dataframe(
+                df_step2_filtered.head(20)[
+                    ["registration", "company_name_display", "work_category", "date", "amount", "description", "dbd_status_display", "transfer_type", "dbd_info_raw"]
+                ].rename(columns={
+                    "registration": "เลขทะเบียน",
+                    "company_name_display": "ชื่อบริษัท/บุคคล",
+                    "work_category": "ประเภทการทำงาน",
+                    "date": "วันที่",
+                    "amount": "จำนวนเงิน",
+                    "description": "คำอธิบาย",
+                    "dbd_status_display": "สถานะข้อมูล DBD",
+                    "transfer_type": "ประเภทผู้ส่งโอน",
+                    "dbd_info_raw": "ข้อมูล DBD"
+                }),
+                use_container_width=True,
+                hide_index=True
             )
 
-            if not selected_registration:
-                st.warning("⚠️ ไม่พบเลขทะเบียนที่พร้อมสำหรับกรอก")
-                return
-        else:
-            # รีเซ็ตค่าเลือกเมื่อเปลี่ยนโหมด
-            st.session_state["selected_registration_number"] = ""
+        with runner_tab:
+            processed_row_keys_list = st.session_state.get("peakengine_processed_row_keys", [])
+            if not isinstance(processed_row_keys_list, list):
+                processed_row_keys_list = []
+            processed_row_keys_set = set(processed_row_keys_list)
 
-        if st.button("♻️ รีเซ็ตสถานะรายการที่กรอกแล้ว", key="reset_peak_processed"):
-            st.session_state["peakengine_processed_regs"] = []
-            st.success("รีเซ็ตสถานะเรียบร้อยแล้ว")
-            st.experimental_rerun()
+            pending_row_records = [
+                record for record in row_records
+                if record.get("row_key") not in processed_row_keys_set
+            ]
+            pending_numbers = [
+                record.get("registration") for record in pending_row_records
+                if record.get("registration")
+            ]
+            pending_unique_numbers = list(dict.fromkeys(pending_numbers))
 
-        log_expander = st.expander("📋 Log การทำงาน", expanded=False)
-        log_placeholder = log_expander.empty()
-        log_messages: List[Dict[str, str]] = []
+            col_stats1, col_stats2, col_stats3 = st.columns(3)
+            with col_stats1:
+                st.metric("รายการที่กรอกแล้ว", len(processed_row_keys_set))
+            with col_stats2:
+                st.metric("รายการที่เหลือ", len(pending_row_records))
+            with col_stats3:
+                st.metric("เลขทะเบียนที่เหลือ (ไม่ซ้ำ)", len(pending_unique_numbers))
 
-        def peak_log(message: str, status: str = "info"):
-            icon_map = {
-                "info": "ℹ️",
-                "success": "✅",
-                "warning": "⚠️",
-                "error": "❌"
-            }
-            log_messages.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "status": status,
-                "message": message
-            })
-            lines = []
-            for entry in log_messages[-200:]:
-                icon = icon_map.get(entry["status"], "📝")
-                lines.append(f"[{entry['time']}] {icon} {entry['message']}")
-            log_placeholder.code("\n".join(lines), language=None)
+            st.caption("เลือกโหมดการทำงาน: กรอกทีละรายการ หรือกรอกต่อเนื่องทุกเลขที่เหลือ")
 
-        col_fill_peak, col_newpeak = st.columns(2)
-        with col_fill_peak:
-            if st.button("📝 เริ่มกรอกเลขทะเบียนลงหน้าเว็บ PEAK", type="primary", key="fill_peak_contacts_btn"):
-                if config is None:
-                    st.error("❌ ไม่พบไฟล์ config.py ไม่สามารถเข้าสู่ระบบ PEAKEngine ได้")
+            fill_mode = st.radio(
+                "โหมดการกรอก:",
+                ["กรอกทีละรายการ", "กรอกต่อเนื่อง (ทั้งหมดที่เหลือ)"],
+                key="peak_fill_mode",
+                horizontal=True
+            )
+
+            run_summary_stats = st.session_state.get("peakengine_run_summary_stats", {})
+            run_summary_df = st.session_state.get("peakengine_run_summary_snapshot")
+
+            st.subheader("📋 รายการที่จะให้บอทรัน")
+            st.write(
+                f"- รายการทั้งหมดที่ผ่านตัวกรอง: {run_summary_stats.get('total_rows', filtered_total)} "
+                f"(เลขทะเบียนไม่ซ้ำ {run_summary_stats.get('unique_regs', filtered_unique_total)})"
+            )
+            st.write(
+                "- รายการที่ DBD ระบุว่าไม่พบข้อมูล: 0 "
+                "(เลขทะเบียนไม่ซ้ำ 0)"
+            )
+            processed_unique_regs = set()
+            for row_key in processed_row_keys_set:
+                record = row_key_map.get(row_key)
+                if record and record.get("registration"):
+                    processed_unique_regs.add(record.get("registration"))
+            st.write(f"- รายการที่เคยรันไปแล้ว: {len(processed_row_keys_set)} (เลขทะเบียนไม่ซ้ำ {len(processed_unique_regs)})")
+            st.write(f"- รายการที่เหลือสำหรับบอทในรอบนี้: {len(pending_row_records)} (เลขทะเบียนไม่ซ้ำ {len(pending_unique_numbers)})")
+            pending_not_found = [
+                reg for reg in pending_unique_numbers
+                if run_summary_df is not None
+                and not run_summary_df.empty
+                and any(
+                    (run_summary_df["registration"] == reg) &
+                    (
+                        run_summary_df["dbd_status_display"].astype(str).str.strip() == "ลูกค้าไม่ประสงค์ออกนาม"
+                    )
+                )
+            ]
+            if pending_not_found:
+                st.write(f"- เลขทะเบียนที่ต้องเจอสถานะ DBD 'ไม่พบข้อมูล': {len(pending_not_found)}")
+                st.code(", ".join(pending_not_found[:20]), language=None)
+                if len(pending_not_found) > 20:
+                    st.caption(f"... และอีก {len(pending_not_found) - 20} รายการ")
+
+            selected_registration = None
+            selected_record = None
+            if fill_mode == "กรอกทีละรายการ":
+                def format_row_option(row_key: str) -> str:
+                    record = row_key_map.get(row_key, {})
+                    registration_value = record.get("registration", "-")
+                    company_value = record.get("company_name_display", "-")
+                    date_value = record.get("date", "-")
+                    amount_value = record.get("amount", "-")
+                    work_category_value = record.get("work_category", "-")
+                    return f"{registration_value} • {company_value} • {date_value} • {amount_value} • {work_category_value}"
+
+                available_row_keys = [
+                    record.get("row_key") for record in pending_row_records
+                    if record.get("row_key") is not None
+                ]
+                if not available_row_keys and row_records:
+                    available_row_keys = [
+                        record.get("row_key") for record in row_records
+                        if record.get("row_key") is not None
+                    ]
+
+                if not available_row_keys:
+                    st.warning("⚠️ ไม่มีรายการให้เลือกสำหรับการกรอก")
                     return
 
-                username = getattr(config, 'PEAKENGINE_USERNAME', '')
-                password = getattr(config, 'PEAKENGINE_PASSWORD', '')
-                link_company = getattr(config, 'Link_conpany', None)
-                link_receipt = getattr(config, 'Link_receipt', None)
-                headless = getattr(config, 'HEADLESS_MODE', False)
+                selected_row_key = st.selectbox(
+                    "เลือกเลขทะเบียนที่จะกรอก:",
+                    available_row_keys,
+                    index=0 if available_row_keys else None,
+                    key="peakengine_selected_row_key",
+                    format_func=format_row_option
+                )
 
-                if not username or not password:
-                    st.error("❌ กรุณากำหนด PEAKENGINE_USERNAME และ PEAKENGINE_PASSWORD ใน config.py ก่อน")
+                if not selected_row_key:
+                    st.warning("⚠️ ไม่พบเลขทะเบียนที่พร้อมสำหรับกรอก")
                     return
+                selected_record = row_key_map.get(selected_row_key)
+                if not selected_record:
+                    st.warning("⚠️ ไม่พบข้อมูลของรายการที่เลือก")
+                    return
+                selected_registration = selected_record.get("registration")
+                target_row_records = [selected_record]
+            else:
+                st.session_state["peakengine_selected_row_key"] = ""
+                target_row_records = pending_row_records
 
-                with st.spinner("กำลังเปิดเบราว์เซอร์และเข้าสู่ระบบ..."):
-                    try:
-                        from peakengine_bot import PeakEngineBot
-                        bot = PeakEngineBot(use_browser=True, headless=headless)
-                        _peakengine_bots.append(bot)
+            if st.button("♻️ รีเซ็ตสถานะรายการที่กรอกแล้ว", key="reset_peak_processed"):
+                st.session_state["peakengine_processed_regs"] = []
+                st.session_state["peakengine_processed_row_keys"] = []
+                st.success("รีเซ็ตสถานะเรียบร้อยแล้ว")
+                st.experimental_rerun()
 
-                        peak_log("🚀 เริ่มเข้าสู่ระบบ PEAKEngine...", "info")
-                        login_success = bot.login(username, password, link_company=link_company, link_receipt=link_receipt, log_callback=peak_log)
+            log_expander = st.expander("📋 Log การทำงาน", expanded=False)
+            log_placeholder = log_expander.empty()
+            log_messages: List[Dict[str, str]] = []
 
-                        if not login_success:
-                            st.error("❌ เข้าสู่ระบบ PEAKEngine ไม่สำเร็จ กรุณาตรวจสอบข้อมูลใน config.py")
-                            return
+            def peak_log(message: str, status: str = "info"):
+                icon_map = {
+                    "info": "ℹ️",
+                    "success": "✅",
+                    "warning": "⚠️",
+                    "error": "❌"
+                }
+                log_messages.append({
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "status": status,
+                    "message": message
+                })
+                lines = []
+                for entry in log_messages[-200:]:
+                    icon = icon_map.get(entry["status"], "📝")
+                    lines.append(f"[{entry['time']}] {icon} {entry['message']}")
+                log_placeholder.code("\n".join(lines), language=None)
 
-                        peak_log("✅ เข้าสู่ระบบเรียบร้อย เตรียมกรอกเลขทะเบียน", "success")
+            col_fill_peak, col_newpeak = st.columns(2)
+            with col_fill_peak:
+                if st.button("📝 เริ่มกรอกเลขทะเบียนลงหน้าเว็บ PEAK", type="primary", key="fill_peak_contacts_btn"):
+                    if config is None:
+                        st.error("❌ ไม่พบไฟล์ config.py ไม่สามารถเข้าสู่ระบบ PEAKEngine ได้")
+                        return
 
-                        if fill_mode == "กรอกทีละรายการ":
-                            fill_targets = [selected_registration]
-                        else:
-                            if not pending_unique_numbers:
-                                st.warning("⚠️ ไม่มีเลขทะเบียนที่เหลือสำหรับกรอก")
+                    username = getattr(config, 'PEAKENGINE_USERNAME', '')
+                    password = getattr(config, 'PEAKENGINE_PASSWORD', '')
+                    link_company = getattr(config, 'Link_conpany', None)
+                    link_receipt = getattr(config, 'Link_receipt', None)
+                    headless = getattr(config, 'HEADLESS_MODE', False)
+
+                    if not username or not password:
+                        st.error("❌ กรุณากำหนด PEAKENGINE_USERNAME และ PEAKENGINE_PASSWORD ใน config.py ก่อน")
+                        return
+
+                    with st.spinner("กำลังเปิดเบราว์เซอร์และเข้าสู่ระบบ..."):
+                        try:
+                            from peakengine_bot import PeakEngineBot
+                            bot = PeakEngineBot(use_browser=True, headless=headless)
+                            _peakengine_bots.append(bot)
+
+                            peak_log("🚀 เริ่มเข้าสู่ระบบ PEAKEngine...", "info")
+                            login_success = bot.login(
+                                username,
+                                password,
+                                link_company=link_company,
+                                link_receipt=link_receipt,
+                                log_callback=peak_log
+                            )
+
+                            if not login_success:
+                                st.error("❌ เข้าสู่ระบบ PEAKEngine ไม่สำเร็จ กรุณาตรวจสอบข้อมูลใน config.py")
                                 return
-                            fill_targets = pending_unique_numbers
-                            st.info(f"🔁 จะกรอกเลขทะเบียนทั้งหมด {len(fill_targets)} รายการที่ยังไม่ได้ทำ")
 
-                        reg_info_map = st.session_state.get("peakengine_reg_info_map", {})
-                        fill_result = bot.fill_contact_fields(
-                            fill_targets,
-                            reg_info_map=reg_info_map,
-                            log_callback=peak_log
-                        )
+                            peak_log("✅ เข้าสู่ระบบเรียบร้อย เตรียมกรอกเลขทะเบียน", "success")
 
-                        if "error" in fill_result:
-                            st.error(f"❌ ไม่สามารถกรอกข้อมูลได้: {fill_result['error']}")
-                        else:
-                            success_count = fill_result.get("success", 0)
-                            total_count = fill_result.get("total", len(fill_targets))
-                            error_list = fill_result.get("errors", [])
-                            processed_values = fill_result.get("processed", [])
-
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("จำนวนที่ต้องกรอก", total_count)
-                            with col2:
-                                st.metric("กรอกสำเร็จ", success_count)
-                            with col3:
-                                st.metric("ไม่สำเร็จ", len(error_list))
-
-                            if processed_values:
-                                processed_set.update(processed_values)
-                                st.session_state["peakengine_processed_regs"] = list(processed_set)
-
-                            if error_list:
-                                st.warning("⚠️ มีบางรายการกรอกไม่สำเร็จ ดูรายละเอียดด้านล่าง")
-                                df_errors = pd.DataFrame(error_list)
-                                st.dataframe(df_errors, use_container_width=True)
+                            if fill_mode == "กรอกทีละรายการ":
+                                fill_targets = [selected_registration] if selected_registration else []
+                                target_row_keys = []
+                                if selected_record and selected_record.get("row_key") is not None:
+                                    target_row_keys.append(selected_record.get("row_key"))
                             else:
-                                if fill_mode == "กรอกทีละรายการ":
-                                    st.success("🎉 กรอกเลขทะเบียนเสร็จสิ้น")
+                                if not target_row_records:
+                                    st.warning("⚠️ ไม่มีรายการที่เหลือสำหรับกรอก")
+                                    return
+                                fill_targets = []
+                                target_row_keys = []
+                                for record in target_row_records:
+                                    reg_candidate = record.get("registration")
+                                    row_key_candidate = record.get("row_key")
+                                    if not reg_candidate or row_key_candidate is None:
+                                        continue
+                                    fill_targets.append(reg_candidate)
+                                    target_row_keys.append(row_key_candidate)
+                                if not fill_targets:
+                                    st.warning("⚠️ ไม่มีเลขทะเบียนที่สามารถกรอกได้")
+                                    return
+                                st.info(f"🔁 จะกรอกเลขทะเบียนทั้งหมด {len(fill_targets)} รายการที่ยังไม่ได้ทำ")
+
+                            reg_info_map = st.session_state.get("peakengine_reg_info_map", {})
+                            row_payload_map_session = st.session_state.get("peakengine_row_payload_map", {})
+                            fill_result = bot.fill_contact_fields(
+                                fill_targets,
+                                reg_info_map=reg_info_map,
+                                row_keys=target_row_keys,
+                                row_payload_map=row_payload_map_session,
+                                log_callback=peak_log
+                            )
+
+                            if "error" in fill_result:
+                                st.error(f"❌ ไม่สามารถกรอกข้อมูลได้: {fill_result['error']}")
+                            else:
+                                success_count = fill_result.get("success", 0)
+                                total_count = fill_result.get("total", len(fill_targets))
+                                error_list = fill_result.get("errors", [])
+                                processed_values = fill_result.get("processed", [])
+
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("จำนวนที่ต้องกรอก", total_count)
+                                with col2:
+                                    st.metric("กรอกสำเร็จ", success_count)
+                                with col3:
+                                    st.metric("ไม่สำเร็จ", len(error_list))
+
+                                processed_row_keys_list = fill_result.get("processed_row_keys", [])
+                                if processed_row_keys_list:
+                                    processed_row_keys_set.update(processed_row_keys_list)
+                                    st.session_state["peakengine_processed_row_keys"] = list(processed_row_keys_set)
+                                if processed_values:
+                                    processed_regs_list = st.session_state.get("peakengine_processed_regs", [])
+                                    processed_regs_list.extend(processed_values)
+                                    st.session_state["peakengine_processed_regs"] = processed_regs_list
+                                receipt_links = fill_result.get("receipt_links", [])
+                                if receipt_links:
+                                    stored_links = st.session_state.get("peakengine_receipt_links", [])
+                                    if not isinstance(stored_links, list):
+                                        stored_links = []
+                                    stored_links.extend(receipt_links)
+                                    st.session_state["peakengine_receipt_links"] = stored_links
+
+                                if error_list:
+                                    st.warning("⚠️ มีบางรายการกรอกไม่สำเร็จ ดูรายละเอียดด้านล่าง")
+                                    df_errors = pd.DataFrame(error_list)
+                                    st.dataframe(df_errors, use_container_width=True)
                                 else:
-                                    st.success("🎉 กรอกเลขทะเบียนที่เหลือทั้งหมดเรียบร้อย")
-
-                            dropdown_data = fill_result.get("dropdown_options", [])
-                            if dropdown_data:
-                                st.subheader("📋 ผลการตรวจสอบ Dropdown หลังกรอก")
-                                for entry in dropdown_data:
-                                    value = entry.get("value", "")
-                                    items = entry.get("items", [])
-                                    st.write(f"**เลขทะเบียน:** {value}")
-                                    if items:
-                                        st.write(f"ตัวเลือก ({len(items)}):")
-                                        st.code("\n".join(items), language=None)
+                                    if fill_mode == "กรอกทีละรายการ":
+                                        st.success("🎉 กรอกเลขทะเบียนเสร็จสิ้น")
                                     else:
-                                        st.write("ไม่มีตัวเลือกแสดงใน dropdown")
+                                        st.success("🎉 กรอกเลขทะเบียนที่เหลือทั้งหมดเรียบร้อย")
 
-                            plus_clicks = fill_result.get("plus_clicked", [])
-                            if plus_clicks:
-                                st.info(f"🔄 มีการคลิก '+ เพิ่มผู้ติดต่อ' สำหรับเลขทะเบียน: {', '.join(plus_clicks)}")
-                            elif dropdown_data:
-                                st.info("ℹ️ ไม่มีการคลิก '+ เพิ่มผู้ติดต่อ' เนื่องจากพบตัวเลือกอื่นใน dropdown")
+                                dropdown_data = fill_result.get("dropdown_options", [])
+                                if dropdown_data:
+                                    st.subheader("📋 ผลการตรวจสอบ Dropdown หลังกรอก")
+                                    for entry in dropdown_data:
+                                        value = entry.get("value", "")
+                                        items = entry.get("items", [])
+                                        st.write(f"**เลขทะเบียน:** {value}")
+                                        if items:
+                                            st.write(f"ตัวเลือก ({len(items)}):")
+                                            st.code("\n".join(items), language=None)
+                                        else:
+                                            st.write("ไม่มีตัวเลือกแสดงใน dropdown")
 
-                            selected_existing = fill_result.get("selected_existing", [])
-                            if selected_existing:
-                                st.success(f"✅ ระบบเลือกผู้ติดต่อที่มีอยู่แล้วสำหรับเลขทะเบียน: {', '.join(selected_existing)}")
+                                plus_clicks = fill_result.get("plus_clicked", [])
+                                if plus_clicks:
+                                    st.info(f"🔄 มีการคลิก '+ เพิ่มผู้ติดต่อ' สำหรับเลขทะเบียน: {', '.join(plus_clicks)}")
+                                elif dropdown_data:
+                                    st.info("ℹ️ ไม่มีการคลิก '+ เพิ่มผู้ติดต่อ' เนื่องจากพบตัวเลือกอื่นใน dropdown")
+
+                                selected_existing = fill_result.get("selected_existing", [])
+                                if selected_existing:
+                                    st.success(f"✅ ระบบเลือกผู้ติดต่อที่มีอยู่แล้วสำหรับเลขทะเบียน: {', '.join(selected_existing)}")
 
                             validation_results = fill_result.get("validation", [])
                             if validation_results:
@@ -2698,9 +3968,26 @@ def render_receipt_bot_page():
                                         mismatch_rows.append(f"{status_symbol} {field}\n  - Excel: {expected}\n  - ระบบ: {actual}")
                                     st.code("\n".join(mismatch_rows), language=None)
 
-                    except Exception as e:
-                        st.error(f"❌ เกิดข้อผิดพลาดระหว่างกรอกข้อมูล: {str(e)}")
-                        peak_log(f"❌ เกิดข้อผิดพลาด: {str(e)}", "error")
+                        except Exception as e:
+                            st.error(f"❌ เกิดข้อผิดพลาดระหว่างกรอกข้อมูล: {str(e)}")
+                            peak_log(f"❌ เกิดข้อผิดพลาด: {str(e)}", "error")
+
+        stored_links = st.session_state.get("peakengine_receipt_links", [])
+        if stored_links:
+            st.subheader("📄 ลิงก์ใบเสร็จที่บันทึกไว้")
+            df_receipts = pd.DataFrame(stored_links)
+            st.dataframe(df_receipts, use_container_width=True)
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                df_receipts.to_excel(writer, index=False, sheet_name="Receipts")
+            excel_buffer.seek(0)
+            st.download_button(
+                label="💾 ดาวน์โหลดลิงก์ใบเสร็จ (Excel)",
+                data=excel_buffer.getvalue(),
+                file_name="receipt_links.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_receipt_links_excel"
+            )
 
         with col_newpeak:
             if st.button("🆕 เปิดระบบ New Peak (ทดลอง)", key="open_newpeak_from_excel"):

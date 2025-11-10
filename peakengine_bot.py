@@ -1,11 +1,11 @@
 import pandas as pd
 import time
 import re
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Tuple
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ตั้งค่า logging
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +89,25 @@ class PeakEngineBot:
                 error_msg = str(e)
                 logger.error(f"❌ ไม่สามารถเปิด Playwright Browser ได้: {error_msg}")
                 raise Exception(f"ไม่สามารถเปิด Browser ได้: {error_msg}\n\n💡 ตรวจสอบ:\n1. Playwright ติดตั้งแล้ว: pip install playwright\n2. Browser binaries ติดตั้งแล้ว: playwright install chromium")
+    
+    @staticmethod
+    def _parse_dbd_text(raw: Any) -> Dict[str, str]:
+        if raw is None:
+            return {}
+        text = str(raw).strip()
+        if not text or text.lower() in {"nan", "none"}:
+            return {}
+        segments = [segment.strip() for segment in text.split("|")]
+        results: Dict[str, str] = {}
+        for segment in segments:
+            if ":" not in segment:
+                continue
+            key, value = segment.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                results[key] = value
+        return results
     
     def open_login_page_and_fill(self, username: str, password: str, link_company: Optional[str] = None, link_receipt: Optional[str] = None, log_callback: Optional[Callable] = None) -> bool:
         """
@@ -580,6 +599,8 @@ class PeakEngineBot:
         values: List[str],
         field_selector: str = '//*[@id="iptcontactname"]',
         reg_info_map: Optional[Dict[str, Any]] = None,
+        row_keys: Optional[List[str]] = None,
+        row_payload_map: Optional[Dict[str, Any]] = None,
         log_callback: Optional[Callable] = None
     ) -> Dict[str, Any]:
         """
@@ -617,13 +638,20 @@ class PeakEngineBot:
                 digits = "0" + digits[1:]
             return digits
 
-        clean_values = []
-        for v in values:
-            normalized = normalize_value(v)
-            if normalized:
-                clean_values.append(normalized)
+        paired_inputs: List[Tuple[str, Optional[str]]] = []
+        if row_keys and len(row_keys) != len(values):
+            log("⚠️ จำนวน row_key ไม่ตรงกับจำนวนเลขทะเบียนที่ต้องกรอก จะจับคู่เฉพาะลำดับที่ตรงกัน", "warning")
 
-        if not clean_values:
+        for idx, v in enumerate(values):
+            normalized = normalize_value(v)
+            if not normalized:
+                continue
+            key_value = None
+            if row_keys and idx < len(row_keys):
+                key_value = row_keys[idx]
+            paired_inputs.append((normalized, key_value))
+
+        if not paired_inputs:
             log("⚠️ ไม่มีค่าที่พร้อมสำหรับกรอก", "warning")
             return {"total": 0, "success": 0, "errors": []}
 
@@ -638,19 +666,28 @@ class PeakEngineBot:
                 asyncio.set_event_loop(loop)
 
             async def async_fill():
+                clean_values = [value for value, _ in paired_inputs]
+                clean_row_keys = [row_key for _, row_key in paired_inputs]
                 results = {
                     "total": len(clean_values),
                     "success": 0,
                     "errors": [],
                     "processed": [],
+                    "processed_row_keys": [],
                     "dropdown_options": [],
                     "plus_clicked": [],
                     "selected_existing": [],
-                    "validation": []
+                    "validation": [],
+                    "receipt_links": []
                 }
 
                 for idx, value in enumerate(clean_values, 1):
                     try:
+                        try:
+                            await self.page.wait_for_selector('#iptnumber', timeout=5000)
+                        except Exception:
+                            log("⚠️ ไม่สามารถรอให้ช่องเลขที่เอกสารถูกโหลดได้ภายในเวลาที่กำหนด", "warning")
+                        current_row_key = clean_row_keys[idx - 1] if idx - 1 < len(clean_row_keys) else None
                         log(f"✏️ ({idx}/{len(clean_values)}) กำลังกรอกเลขทะเบียน: {value}", "info")
                         input_element = await self.page.wait_for_selector(field_selector, timeout=5000)
                         await input_element.click()
@@ -661,13 +698,19 @@ class PeakEngineBot:
                         await asyncio.sleep(0.1)
                         await input_element.fill(value)
                         log(f"✅ กรอก {value} สำเร็จ", "success")
+                        await asyncio.sleep(0.5)
                         results["success"] += 1
                         results["processed"].append(value)
-                        reg_info = reg_info_map.get(value) if reg_info_map else None
-                        dropdown_items = []
-                        selectable_option = None
+                        if current_row_key:
+                            results["processed_row_keys"].append(current_row_key)
+                        reg_info = None
+                        if current_row_key and row_payload_map:
+                            reg_info = row_payload_map.get(current_row_key)
+                        if not reg_info and reg_info_map:
+                            reg_info = reg_info_map.get(value)
+                        dropdown_items: List[str] = []
+                        non_plus_options: List[Tuple[Any, str]] = []
                         existing_selected = False
-                        selectable_text = None
                         plus_option = None
                         dropdown_container = None
                         dropdown_selectors = [
@@ -698,16 +741,46 @@ class PeakEngineBot:
                                         cleaned_text = option_text.strip()
                                         if cleaned_text:
                                             dropdown_items.append(cleaned_text)
-                                        if cleaned_text.startswith('+ เพิ่มผู้ติดต่อ') and selectable_option is None:
+                                        if cleaned_text.startswith('+ เพิ่มผู้ติดต่อ'):
                                             plus_option = option
-                                        elif selectable_option is None:
-                                            selectable_option = option
-                                            selectable_text = cleaned_text
+                                        else:
+                                            non_plus_options.append((option, cleaned_text))
                                     except Exception:
                                         continue
 
                                 if dropdown_items:
-                                    if dropdown_items == ['+ เพิ่มผู้ติดต่อ'] and plus_option is not None:
+                                    target_option = None
+                                    target_text = None
+                                    if non_plus_options:
+                                        expected_texts: List[str] = []
+                                        if reg_info:
+                                            for key in ["company_name_display", "company_name", "ชื่อบริษัท/บุคคล", "ชื่อบริษัทจาก DBD"]:
+                                                value_candidate = reg_info.get("row", {}).get(key) if isinstance(reg_info.get("row"), dict) else None
+                                                if not value_candidate:
+                                                    value_candidate = reg_info.get(key)
+                                                if value_candidate:
+                                                    expected_texts.append(str(value_candidate).strip())
+                                        matched = None
+                                        if expected_texts:
+                                            for option, text_value in non_plus_options:
+                                                for expected in expected_texts:
+                                                    if expected and expected in text_value:
+                                                        matched = (option, text_value)
+                                                        break
+                                                if matched:
+                                                    break
+                                        if matched:
+                                            target_option, target_text = matched
+                                        else:
+                                            target_option, target_text = non_plus_options[0]
+                                    elif plus_option is not None:
+                                        target_option = plus_option
+                                        target_text = dropdown_items[0]
+
+                                    if target_option is plus_option and len(dropdown_items) > 1 and non_plus_options:
+                                        target_option, target_text = non_plus_options[0]
+
+                                    if target_option is plus_option and plus_option is not None:
                                         try:
                                             await plus_option.click()
                                             plus_option_clicked = True
@@ -715,10 +788,10 @@ class PeakEngineBot:
                                             await asyncio.sleep(1)
                                         except Exception as click_error:
                                             log(f"⚠️ คลิก '+ เพิ่มผู้ติดต่อ' ไม่สำเร็จ: {click_error}", "warning")
-                                    elif selectable_option is not None:
+                                    elif target_option is not None:
                                         try:
-                                            await selectable_option.click()
-                                            chosen_text = selectable_text or dropdown_items[min(1, len(dropdown_items)-1)]
+                                            await target_option.click()
+                                            chosen_text = target_text or dropdown_items[min(1, len(dropdown_items) - 1)]
                                             log(f"✅ เลือกรายการ '{chosen_text}' จาก dropdown", "success")
                                             await asyncio.sleep(0.5)
                                             existing_selected = True
@@ -801,7 +874,9 @@ class PeakEngineBot:
                                                 results.setdefault("validation", []).append(validation)
                                                 if validation.get("overall_match"):
                                                     await self._confirm_create_contact(log)
-                                                    await self._post_validation_tasks(reg_info, log)
+                                                    receipt_record = await self._post_validation_tasks(reg_info, log)
+                                                    if receipt_record:
+                                                        results["receipt_links"].append(receipt_record)
                                         elif not_found and not reg_info:
                                             log("⚠️ ไม่มีข้อมูลในไฟล์ Excel สำหรับเติมในหน้าต่างเพิ่มผู้ติดต่อ", "warning")
                                         else:
@@ -810,12 +885,26 @@ class PeakEngineBot:
                                                 if validation:
                                                     results.setdefault("validation", []).append(validation)
                                                     if validation.get("overall_match"):
-                                                        await self._confirm_create_contact(log)
-                                                        await self._post_validation_tasks(reg_info, log)
+                                                        # คลิกปุ่มเพิ่มลูกค้า/ผู้จ่ายเงิน
+                                                        try:
+                                                            add_button = await self.page.wait_for_selector('#contactcreatebtn', timeout=2000)
+                                                            if add_button:
+                                                                await add_button.click()
+                                                                log("✅ กดปุ่ม 'เพิ่มลูกค้า/ผู้จ่ายเงิน' หลังค้นหาสำเร็จ", "success")
+                                                                await asyncio.sleep(0.5)
+                                                            else:
+                                                                log("⚠️ ไม่พบปุ่ม 'เพิ่มลูกค้า/ผู้จ่ายเงิน'", "warning")
+                                                        except Exception as add_error:
+                                                            log(f"⚠️ ไม่สามารถกดปุ่ม 'เพิ่มลูกค้า/ผู้จ่ายเงิน': {add_error}", "warning")
+                                                        receipt_record = await self._post_validation_tasks(reg_info, log)
+                                                        if receipt_record:
+                                                            results["receipt_links"].append(receipt_record)
                                             elif success_found:
                                                 log("ℹ️ ระบบค้นหาสำเร็จแต่ไม่มีข้อมูล Excel สำหรับตรวจสอบ", "info")
                                     elif existing_selected and reg_info:
-                                        await self._post_validation_tasks(reg_info, log)
+                                        receipt_record = await self._post_validation_tasks(reg_info, log)
+                                        if receipt_record:
+                                            results["receipt_links"].append(receipt_record)
                                 else:
                                     log("⚠️ ไม่พบช่องกรอกเลข 13 หลักในหน้าต่างเพิ่มผู้ติดต่อ", "warning")
                             except Exception as modal_error:
@@ -823,7 +912,9 @@ class PeakEngineBot:
                         elif existing_selected:
                             log("ℹ️ เลือกผู้ติดต่อที่มีอยู่แล้ว - ดำเนินกรอกข้อมูลต่อ", "info")
                             if reg_info:
-                                await self._post_validation_tasks(reg_info, log)
+                                receipt_record = await self._post_validation_tasks(reg_info, log)
+                                if receipt_record:
+                                    results["receipt_links"].append(receipt_record)
                             else:
                                 log("ℹ️ ไม่มีข้อมูลจาก Excel สำหรับดำเนินการต่อ", "info")
                         await asyncio.sleep(0.2)
@@ -831,6 +922,8 @@ class PeakEngineBot:
                         error_msg = str(e)
                         log(f"❌ กรอก {value} ไม่สำเร็จ: {error_msg}", "error")
                         results["errors"].append({"index": idx, "value": value, "error": error_msg})
+                        if isinstance(e, RuntimeError) and "ประเภทการทำงานที่ไม่รองรับ" in error_msg:
+                            raise
                         await asyncio.sleep(0.2)
 
                 return results
@@ -1032,6 +1125,75 @@ class PeakEngineBot:
             row_data = info.get("row", {}) or {}
             transfer_type = info.get("transfer_type", "")
             company_name_raw = info.get("company_name", "") or dbd_info.get("ชื่อบริษัท")
+            step2_row = info.get("step2_row", {}) or {}
+
+            if step2_row:
+                parsed_step2 = self._parse_dbd_text(step2_row.get("dbd_info_raw"))
+                if parsed_step2:
+                    merged = dict(dbd_info)
+                    for key, value in parsed_step2.items():
+                        if key not in merged or not merged[key]:
+                            merged[key] = value
+                    dbd_info = merged
+
+                merged_row: Dict[str, Any] = dict(row_data)
+                for key, value in step2_row.items():
+                    if key not in merged_row or not merged_row[key]:
+                        merged_row[key] = value
+                row_data = merged_row
+
+                if step2_row.get("dbd_company_name"):
+                    dbd_info.setdefault("ชื่อบริษัท", step2_row.get("dbd_company_name"))
+                if step2_row.get("dbd_business_type"):
+                    dbd_info.setdefault("ประเภทธุรกิจ", step2_row.get("dbd_business_type"))
+                if step2_row.get("dbd_status_detail"):
+                    dbd_info.setdefault("สถานะ", step2_row.get("dbd_status_detail"))
+                if step2_row.get("dbd_capital"):
+                    dbd_info.setdefault("ทุนจดทะเบียน", step2_row.get("dbd_capital"))
+                if step2_row.get("dbd_address_text"):
+                    dbd_info.setdefault("ที่อยู่", step2_row.get("dbd_address_text"))
+                if step2_row.get("dbd_registration"):
+                    dbd_info.setdefault("เลขทะเบียน", step2_row.get("dbd_registration"))
+
+                if step2_row.get("dbd_address_text") and not row_data.get("ที่อยู่"):
+                    row_data["ที่อยู่"] = step2_row.get("dbd_address_text")
+
+                address_backfill = {
+                    "dbd_address_house_no": "ที่อยู่_บ้านเลขที่",
+                    "dbd_address_village": "ที่อยู่_หมู่บ้าน",
+                    "dbd_address_moo": "ที่อยู่_หมู่ที่",
+                    "dbd_address_subdistrict": "ที่อยู่_ตำบล",
+                    "dbd_address_district": "ที่อยู่_อำเภอ",
+                    "dbd_address_province": "ที่อยู่_จังหวัด",
+                    "dbd_address_postal_code": "ที่อยู่_รหัสไปรษณีย์"
+                }
+                for source_key, target_key in address_backfill.items():
+                    if source_key in step2_row and step2_row.get(source_key) and not row_data.get(target_key):
+                        row_data[target_key] = step2_row.get(source_key)
+
+                if not transfer_type:
+                    transfer_type = step2_row.get("transfer_type", "")
+                if not company_name_raw:
+                    company_name_raw = step2_row.get("dbd_company_name") or step2_row.get("company_name")
+
+            if not dbd_info and row_data.get("ข้อมูล DBD"):
+                dbd_info = self._parse_dbd_text(row_data.get("ข้อมูล DBD"))
+
+            if not transfer_type:
+                transfer_type = row_data.get("ประเภทผู้ส่งโอน", "")
+
+            if not company_name_raw:
+                company_name_candidates = [
+                    info.get("company_name"),
+                    row_data.get("ชื่อบริษัทจาก DBD"),
+                    row_data.get("ชื่อบริษัท/บุคคล"),
+                    dbd_info.get("ชื่อบริษัท"),
+                    dbd_info.get("ชื่อกิจการ")
+                ]
+                for candidate in company_name_candidates:
+                    if candidate:
+                        company_name_raw = candidate
+                        break
 
             if transfer_type and "บริษัท (บจก.)" in transfer_type:
                 try:
@@ -1045,8 +1207,48 @@ class PeakEngineBot:
                             if option:
                                 await option.click()
                                 log("✅ เลือกประเภทนิติบุคคล 'บริษัทจำกัด'", "success")
+                        if not option:
+                            try:
+                                text_option = await self.page.wait_for_selector(
+                                    '//div[@id="mdccddlmerchanttype"]//div[contains(@class,"item") and contains(text(),"บริษัทจำกัด")]',
+                                    timeout=2000
+                                )
+                                if text_option:
+                                    await text_option.click()
+                                    log("✅ เลือกประเภทนิติบุคคล 'บริษัทจำกัด' (ค้นหาด้วยข้อความ)", "success")
+                            except Exception:
+                                pass
                 except Exception as e:
                     log(f"⚠️ ไม่สามารถเลือกประเภทบริษัทจำกัด: {e}", "warning")
+            elif transfer_type and "ห้างหุ้นส่วน" in transfer_type:
+                try:
+                    dropdown = await self.page.wait_for_selector('#mdccddlmerchanttype', timeout=2000)
+                    if dropdown:
+                        current_value = await dropdown.inner_text()
+                        if "ห้างหุ้นส่วน" not in current_value:
+                            await dropdown.click()
+                            await asyncio.sleep(0.2)
+                            option = None
+                            try:
+                                option = await self.page.wait_for_selector('#mdccddlmerchanttype .menu .item[data-value="3"]', timeout=2000)
+                                if option:
+                                    await option.click()
+                                    log("✅ เลือกประเภทนิติบุคคล 'ห้างหุ้นส่วนจำกัด'", "success")
+                            except Exception:
+                                option = None
+                            if not option:
+                                try:
+                                    text_option = await self.page.wait_for_selector(
+                                        '//div[@id="mdccddlmerchanttype"]//div[contains(@class,"item") and contains(text(),"ห้างหุ้นส่วน")]',
+                                        timeout=2000
+                                    )
+                                    if text_option:
+                                        await text_option.click()
+                                        log("✅ เลือกประเภทนิติบุคคล 'ห้างหุ้นส่วนจำกัด' (ค้นหาด้วยข้อความ)", "success")
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    log(f"⚠️ ไม่สามารถเลือกประเภทห้างหุ้นส่วนจำกัด: {e}", "warning")
 
             if company_name_raw:
                 cleaned_name = self._clean_company_name(company_name_raw)
@@ -1180,11 +1382,26 @@ class PeakEngineBot:
             "match": normalize(expected_province) == normalize(actual_province)
         })
 
-        all_match = all(item["match"] for item in comparisons)
+        address_field_name = "ที่อยู่ (บ้านเลขที่/หมู่บ้าน/หมู่ที่)"
+        address_mismatch = None
+        non_address_comparisons = []
+        for item in comparisons:
+            if item["field"] == address_field_name:
+                if not item["match"]:
+                    address_mismatch = item
+                continue
+            non_address_comparisons.append(item)
+
+        all_match = all(item["match"] for item in non_address_comparisons)
         if all_match:
             log("✅ ข้อมูลที่ระบบค้นหากลับมาตรงกับข้อมูลใน Excel", "success")
         else:
             log("⚠️ ข้อมูลที่ระบบค้นหากลับมาไม่ตรงกับ Excel บางรายการ", "warning")
+        if address_mismatch:
+            log(
+                f"📝 ที่อยู่ไม่ตรงกับข้อมูล Excel (บ้านเลขที่/หมู่บ้าน/หมู่ที่) -> ระบบ: {address_mismatch['actual']} | Excel: {address_mismatch['expected']} | หมายเหตุ: ที่อยู่ไม่ตรงกับสรรพากร",
+                "warning"
+            )
 
         validation_result = {
             "registration": info.get("registration"),
@@ -1196,15 +1413,33 @@ class PeakEngineBot:
 
     async def _post_validation_tasks(self, info: Dict[str, Any], log: Callable[[str, str], None]) -> None:
         row_data = info.get("row", {}) or {}
-        desired_date = self._normalize_component(row_data.get("วันที่")) or self._normalize_component(info.get("date"))
+        desired_date = (
+            self._normalize_component(row_data.get("document_date_raw"))
+            or self._normalize_component(row_data.get("วันที่"))
+            or self._normalize_component(info.get("document_date_raw"))
+            or self._normalize_component(info.get("date"))
+        )
         if not await self._wait_for_document_number_ready(log):
             return
         if desired_date:
             await self._fill_document_date(desired_date, log)
         else:
             log("ℹ️ ไม่มีข้อมูลวันที่จาก Excel สำหรับกรอก", "info")
+        row_data.setdefault("registration", info.get("registration"))
+        row_data.setdefault("company_name", info.get("company_name"))
+        row_data.setdefault("work_category", info.get("work_category"))
+        row_data.setdefault("amount", info.get("amount"))
+        row_data.setdefault("date", info.get("date"))
         await self._fill_tarremark(row_data, log)
         await self._fill_product_template(log)
+        category_ok = await self._apply_tax_settings(row_data, log)
+        if category_ok is False:
+            log("ℹ️ ข้ามรายการนี้เนื่องจากประเภทการทำงานอยู่ในรายการข้าม", "info")
+            return None
+        await self._select_bank_account(row_data, log)
+        await self._submit_receipt(log)
+        await asyncio.sleep(1)
+        return await self._capture_receipt_document(row_data, log)
 
     async def _wait_for_document_number_ready(self, log: Callable[[str, str], None]) -> bool:
         try:
@@ -1350,12 +1585,371 @@ class PeakEngineBot:
         except Exception as e:
             log(f"⚠️ ไม่สามารถเลือกสินค้า/บริการ: {e}", "warning")
 
+    def _parse_amount_value(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                if pd.isna(value):
+                    return None
+            except Exception:
+                pass
+            return float(value)
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "-", "--"}:
+            return None
+        text = text.replace(",", "").replace("+", "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    async def _apply_tax_settings(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> bool:
+        work_category = self._normalize_component(row_data.get("work_category"))
+        if not work_category:
+            work_category = self._normalize_component(row_data.get("ประเภทการทำงาน"))
+
+        skip_categories = {"", "-", "ไม่มีประเภทงาน", "เปิดบิลแล้ว", "เปิดบิลเอง", "บอทไม่ทำงาน"}
+        valid_category_map = {
+            "ภาษีปกติ": "standard",
+            "หักณที่จ่าย": "withholding"
+        }
+
+        normalized_category = work_category.replace(" ", "").lower() if work_category else ""
+        if normalized_category in skip_categories:
+            log(f"ℹ️ ประเภทการทำงาน '{work_category or 'ว่าง'}' อยู่ในรายการข้าม", "info")
+            return False
+
+        category_type = valid_category_map.get(normalized_category)
+        if not category_type:
+            raise RuntimeError(f"พบประเภทการทำงานที่ไม่รองรับ: {work_category or 'ว่าง'}")
+
+        log(f"ℹ️ ประเภทการทำงาน: {work_category}", "info")
+
+        amount_value = row_data.get("amount_numeric")
+        amount_numeric = self._parse_amount_value(amount_value)
+        if amount_numeric is None:
+            amount_numeric = self._parse_amount_value(row_data.get("amount"))
+        if amount_numeric is None:
+            amount_numeric = self._parse_amount_value(row_data.get("จำนวนเงิน"))
+
+        if amount_numeric is None:
+            log("⚠️ ไม่พบยอดเงินสำหรับตั้งราคาสินค้า", "warning")
+            return False
+
+        amount_to_fill = amount_numeric
+        if category_type == "withholding":
+            amount_to_fill = amount_numeric / 1.04
+
+        formatted_price = f"{amount_to_fill:.2f}"
+
+        try:
+            price_input = await self.page.wait_for_selector('#iptprice1', timeout=2000)
+            if price_input:
+                current_value_float: Optional[float] = None
+                for attempt in range(1, 4):
+                    try:
+                        await price_input.click()
+                    except Exception:
+                        pass
+                    try:
+                        await price_input.press("Control+A")
+                    except Exception:
+                        try:
+                            await price_input.press("Meta+A")
+                        except Exception:
+                            pass
+                    try:
+                        await price_input.fill("")
+                    except Exception:
+                        pass
+                    await price_input.fill(formatted_price)
+                    try:
+                        await self.page.evaluate(
+                            """(value) => {
+                                const el = document.querySelector('#iptprice1');
+                                if (el) {
+                                    el.value = value;
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                }
+                            }""",
+                            formatted_price
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.3)
+                    try:
+                        current_value = await price_input.input_value()
+                    except Exception:
+                        current_value = None
+                    numeric_text = (current_value or "").replace(",", "").strip() if current_value else ""
+                    try:
+                        current_value_float = float(numeric_text) if numeric_text else None
+                    except Exception:
+                        current_value_float = None
+                    if current_value_float and abs(current_value_float) > 0.0001:
+                        break
+                    if attempt < 3:
+                        log("ℹ️ พบว่ายอดราคายังคงเป็น 0 กำลังพยายามตั้งค่าอีกครั้ง", "info")
+                if current_value_float and abs(current_value_float) > 0.0001:
+                    log(f"✅ ตั้งราคาสินค้าเป็น {formatted_price}", "success")
+                else:
+                    log("⚠️ ไม่สามารถตั้งราคาสินค้าให้แตกต่างจาก 0 ได้หลังพยายามหลายครั้ง", "warning")
+                try:
+                    description_field = await self.page.wait_for_selector('#iptdescription1', timeout=1000)
+                    if description_field:
+                        await description_field.click()
+                        log("✅ คลิกช่องรายละเอียดสินค้า (#iptdescription1) หลังตั้งราคา", "success")
+                except Exception as desc_click_error:
+                    log(f"⚠️ ไม่สามารถคลิกช่องรายละเอียดสินค้า: {desc_click_error}", "warning")
+                await asyncio.sleep(1)
+            else:
+                log("⚠️ ไม่พบช่องราคา (#iptprice1)", "warning")
+        except Exception as price_error:
+            log(f"⚠️ ไม่สามารถตั้งราคาสินค้า: {price_error}", "warning")
+
+        try:
+            tax_select = await self.page.wait_for_selector('#ddltaxstatus', timeout=2000)
+            if tax_select:
+                tax_option_value = "1" if category_type == "standard" else "0"
+                try:
+                    await tax_select.select_option(tax_option_value)
+                except Exception:
+                    await self.page.evaluate(
+                        """(value) => {
+                            const el = document.querySelector('#ddltaxstatus');
+                            if (el) {
+                                el.value = value;
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        }""",
+                        tax_option_value
+                    )
+                tax_label = "รวมภาษี" if tax_option_value == "1" else "แยกภาษี"
+                log(f"✅ เปลี่ยนสถานะภาษีเป็น '{tax_label}'", "success")
+            else:
+                log("⚠️ ไม่พบตัวเลือกสถานะภาษี (#ddltaxstatus)", "warning")
+        except Exception as tax_error:
+            log(f"⚠️ ไม่สามารถเปลี่ยนสถานะภาษี: {tax_error}", "warning")
+
+        if category_type == "withholding":
+            try:
+                vat_select = await self.page.wait_for_selector('#ddlvattypeid1', timeout=2000)
+                if vat_select:
+                    await vat_select.select_option("3")
+                    log("✅ ตั้งประเภทภาษีมูลค่าเพิ่มเป็น 7%", "success")
+                else:
+                    log("⚠️ ไม่พบตัวเลือกภาษีมูลค่าเพิ่ม (#ddlvattypeid1)", "warning")
+            except Exception as vat_error:
+                log(f"⚠️ ไม่สามารถตั้งประเภทภาษีมูลค่าเพิ่ม: {vat_error}", "warning")
+
+            wht_dropdown_selectors = [
+                '#whtDropDown1',
+                '//div[@id="whtDropDown1"]',
+                '#ddlwhtpercent1',
+                'div#ddlwhtpercent1',
+                '//div[@id="ddlwhtpercent1"]'
+            ]
+            wht_dropdown = None
+            for selector in wht_dropdown_selectors:
+                try:
+                    candidate = await self.page.wait_for_selector(selector, timeout=1000)
+                    if candidate:
+                        wht_dropdown = candidate
+                        break
+                except Exception:
+                    wht_dropdown = None
+            if wht_dropdown:
+                try:
+                    await wht_dropdown.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.2)
+                    await wht_dropdown.click()
+                    await asyncio.sleep(0.2)
+                    # หากคลิกแล้วยังไม่เปิด ลองคลิกซ้ำอีกครั้ง
+                    try:
+                        menu_visible = await self.page.wait_for_selector('//div[@id="whtDropDown1"]//div[contains(@class,"menu") and contains(@class,"visible")]', timeout=500)
+                        if not menu_visible:
+                            await wht_dropdown.click()
+                            await asyncio.sleep(0.2)
+                    except Exception:
+                        await wht_dropdown.click()
+                        await asyncio.sleep(0.2)
+                    wht_option = await self.page.wait_for_selector('//div[@id="whtDropDown1"]//div[contains(@class,"item") and @data-value="3"]', timeout=2000)
+                    if wht_option:
+                        await wht_option.click()
+                        log("✅ ตั้งอัตราหัก ณ ที่จ่ายเป็น 3%", "success")
+                    else:
+                        log("⚠️ ไม่พบตัวเลือกหัก ณ ที่จ่าย 3%", "warning")
+                except Exception as wht_error:
+                    log(f"⚠️ ไม่สามารถตั้งอัตราหัก ณ ที่จ่าย: {wht_error}", "warning")
+            else:
+                log("⚠️ ไม่พบ dropdown อัตราหัก ณ ที่จ่าย", "warning")
+
+        return True
+
+    async def _select_bank_account(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> None:
+        log("🔽 กำลังเลือกบัญชีธนาคาร...", "info")
+        try:
+            dropdown_trigger = None
+            dropdown_selector_used = None
+            dropdown_selectors = [
+                '//div[contains(@class,"ui dropdown") and descendant::div[@data-value="1846418"]]',
+                '#ddltargetaccount',
+                'div#ddltargetaccount',
+                'div[name="ddltargetaccount"]',
+                'div[data-ddl="targetaccount"]',
+                'div[data-name="ddltargetaccount"]'
+            ]
+            for selector in dropdown_selectors:
+                try:
+                    candidate = await self.page.wait_for_selector(selector, timeout=1000)
+                    if candidate:
+                        dropdown_trigger = candidate
+                        dropdown_selector_used = selector
+                        break
+                except Exception:
+                    dropdown_trigger = None
+
+            if not dropdown_trigger:
+                log("⚠️ ไม่พบ dropdown เลือกบัญชีธนาคาร", "warning")
+                return
+
+            await dropdown_trigger.scroll_into_view_if_needed()
+            await asyncio.sleep(0.3)
+            try:
+                await dropdown_trigger.click()
+            except Exception:
+                try:
+                    if dropdown_selector_used and dropdown_selector_used.startswith("#"):
+                        await self.page.evaluate(
+                            """(selector) => {
+                                const el = document.querySelector(selector);
+                                if (el) {
+                                    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                                }
+                            }""",
+                            dropdown_selector_used
+                        )
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+
+            target_text = "ธ.กสิกรไทย ออมทรัพย์ - 054-1-28372-2 ได้หมดถ้าสดชื่อ"
+            bank_option_selectors = [
+                f'//div[contains(@class,"item") and contains(@data-value,"1846418")]',
+                f'//div[contains(@class,"item") and normalize-space()="{target_text}"]',
+                f'//div[contains(@class,"item") and contains(text(),"ธ.กสิกรไทย ออมทรัพย์ - 054-1-28372-2")]'
+            ]
+
+            for selector in bank_option_selectors:
+                try:
+                    option = await self.page.wait_for_selector(selector, timeout=1000)
+                    if option:
+                        await option.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.2)
+                        await option.click()
+                        log("✅ เลือกบัญชีธ.กสิกรไทย 054-1-28372-2", "success")
+                        break
+                except Exception:
+                    continue
+            else:
+                log("⚠️ ไม่พบตัวเลือกบัญชีธ.กสิกรไทย 054-1-28372-2 ใน dropdown", "warning")
+        except Exception as e:
+            log(f"⚠️ ไม่สามารถเลือกบัญชีธนาคาร: {e}", "warning")
+
+    async def _submit_receipt(self, log: Callable[[str, str], None]) -> None:
+        log("🆗 กำลังกดปุ่มอนุมัติรายการ...", "info")
+        try:
+            approve_button_selector = '//div[@name="buttonOnLoading" and contains(@class,"button-green") and contains(.,"อนุมัติรายการ")]'
+            approve_button = await self.page.wait_for_selector(approve_button_selector, timeout=2000)
+            if approve_button:
+                await approve_button.scroll_into_view_if_needed()
+                await asyncio.sleep(0.3)
+                await approve_button.click()
+                log("✅ กดปุ่ม 'อนุมัติรายการ' สำเร็จ", "success")
+                await asyncio.sleep(1)
+            else:
+                log("⚠️ ไม่พบปุ่ม 'อนุมัติรายการ'", "warning")
+        except Exception as e:
+            log(f"⚠️ ไม่สามารถกดปุ่ม 'อนุมัติรายการ': {e}", "warning")
+
+    async def _capture_receipt_document(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> Optional[Dict[str, Any]]:
+        try:
+            header_selector = 'h3.section-header-doc-left'
+            header_element = await self.page.wait_for_selector(header_selector, timeout=5000)
+            receipt_number = None
+            if header_element:
+                header_text = await header_element.inner_text()
+                match = re.search(r"#\s*([A-Za-z0-9\-]+)", header_text)
+                if match:
+                    receipt_number = match.group(1)
+                    log(f"✅ พบเลขที่ใบเสร็จ: {receipt_number}", "success")
+                else:
+                    log(f"⚠️ ไม่พบเลขที่ใบเสร็จในข้อความ: {header_text}", "warning")
+            else:
+                log("⚠️ ไม่พบหัวข้อใบเสร็จบนหน้าเว็บ", "warning")
+
+            pdf_button_selector = '#bntOpenPdf'
+            pdf_button = await self.page.wait_for_selector(pdf_button_selector, timeout=3000)
+            if not pdf_button:
+                log("⚠️ ไม่พบปุ่มพิมพ์เอกสาร (#bntOpenPdf)", "warning")
+                return None
+
+            log("🖨️ กำลังเปิดเอกสารใบเสร็จ...", "info")
+            new_page = None
+            try:
+                async with self.page.context.expect_page(timeout=5000) as new_page_info:
+                    await pdf_button.click()
+                new_page = await new_page_info.value
+            except Exception as e:
+                log(f"⚠️ ไม่สามารถเปิดแท็บใบเสร็จใหม่: {e}", "warning")
+                try:
+                    await pdf_button.click()
+                except Exception:
+                    pass
+
+            if new_page:
+                try:
+                    await new_page.wait_for_load_state()
+                except Exception:
+                    pass
+                pdf_url = new_page.url
+                try:
+                    await new_page.close()
+                except Exception:
+                    pass
+                if receipt_number:
+                    log(f"📄 ลิงก์ใบเสร็จ {receipt_number}: {pdf_url}", "success")
+                else:
+                    log(f"📄 ลิงก์ใบเสร็จ: {pdf_url}", "success")
+                return {
+                    "registration": row_data.get("registration") or row_data.get("เลขทะเบียน"),
+                    "company_name": row_data.get("company_name") or row_data.get("ชื่อบริษัท/บุคคล"),
+                    "document_date": row_data.get("date") or row_data.get("วันที่"),
+                    "amount": row_data.get("amount") or row_data.get("จำนวนเงิน"),
+                    "work_category": row_data.get("work_category") or row_data.get("ประเภทการทำงาน"),
+                    "receipt_number": receipt_number,
+                    "pdf_url": pdf_url
+                }
+            else:
+                log("⚠️ ไม่สามารถดึงลิงก์ใบเสร็จได้", "warning")
+                return None
+        except Exception as e:
+            log(f"⚠️ เกิดข้อผิดพลาดขณะดึงข้อมูลใบเสร็จ: {e}", "warning")
+            return None
+
     async def _fill_tarremark(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> None:
         description_text = self._normalize_component(row_data.get("คำอธิบาย"))
         account_suffix = self._extract_account_suffix(description_text)
         if not account_suffix:
             log("ℹ️ ไม่พบเลขบัญชี 4 หลักสำหรับใส่ในหมายเหตุ", "info")
-        date_text = self._normalize_component(row_data.get("วันที่"))
+        date_text = (
+            self._normalize_component(row_data.get("document_date_raw"))
+            or self._normalize_component(row_data.get("วันที่"))
+        )
         time_text = self._normalize_component(row_data.get("เวลา"))
         if not date_text and not time_text:
             combined = (
@@ -1417,14 +2011,39 @@ class PeakEngineBot:
             log(f"⚠️ ไม่สามารถกรอกอ้างอิง: {e}", "warning")
 
     def _format_target_date(self, value: str) -> Optional[str]:
-        if not value:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
             return None
-        text = value.strip()
+        if isinstance(value, (int, float)):
+            try:
+                base_date = datetime(1899, 12, 30)
+                converted = base_date + timedelta(days=float(value))
+                return converted.strftime("%d/%m/%Y")
+            except Exception:
+                pass
+        if isinstance(value, datetime):
+            return value.strftime("%d/%m/%Y")
+        if isinstance(value, pd.Timestamp):
+            try:
+                return value.to_pydatetime().strftime("%d/%m/%Y")
+            except Exception:
+                pass
+        text = str(value).strip()
+        if not text or text in {"nan", "none", "-", "--"}:
+            return None
+        text = text.replace("T", " ").replace("Z", "").strip()
+        if "+" in text:
+            text = text.split("+", 1)[0].strip()
         fmt_list = [
             "%d/%m/%Y",
             "%d-%m-%Y",
             "%d/%m/%y",
             "%Y-%m-%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%d-%m-%Y %H:%M:%S",
+            "%d-%m-%Y %H:%M",
             "%d %b %Y",
             "%d %b %y"
         ]
@@ -1434,6 +2053,11 @@ class PeakEngineBot:
                 return dt.strftime("%d/%m/%Y")
             except Exception:
                 continue
+        if " " in text:
+            primary = text.split(" ", 1)[0].strip()
+            fallback = self._format_target_date(primary)
+            if fallback:
+                return fallback
         thai_pattern = re.match(r"(\d{1,2})\s+([ก-๙]+)\s+(\d{4})", text)
         if thai_pattern:
             day = int(thai_pattern.group(1))
@@ -1483,6 +2107,16 @@ class PeakEngineBot:
                 return ""
             if value.is_integer():
                 value = int(value)
+        if isinstance(value, (datetime, pd.Timestamp)):
+            try:
+                return self._format_target_date(value) or ""
+            except Exception:
+                try:
+                    if isinstance(value, pd.Timestamp):
+                        return value.to_pydatetime().strftime("%d/%m/%Y")
+                    return value.strftime("%d/%m/%Y")
+                except Exception:
+                    value = value.isoformat()
         text = str(value).strip()
         return "" if text in ("", "0", "-", "--") else text
 
