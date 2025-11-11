@@ -31,6 +31,9 @@ class PeakEngineBot:
         self.playwright = None
         self._executor = None
         self.is_logged_in = False
+        self.link_company: Optional[str] = None
+        self.link_receipt: Optional[str] = None
+        self._screen_size = {'width': 1920, 'height': 1080}
         
         if use_browser:
             try:
@@ -63,12 +66,13 @@ class PeakEngineBot:
                             logger.info("📄 กำลังสร้าง browser context...")
                             context = await browser.new_context(
                                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                                viewport={'width': 1920, 'height': 1080},
-                                screen={'width': 1920, 'height': 1080}
+                                viewport=None,
+                                screen=self._screen_size
                             )
                             
                             logger.info("🆕 กำลังสร้าง new page...")
                             page = await context.new_page()
+                            await self._maximize_window(page)
                             
                             logger.info("✅ เปิด Playwright Browser สำเร็จ!")
                             return pw, browser, page
@@ -500,6 +504,7 @@ class PeakEngineBot:
                                 # ใช้ลิงค์ที่อ่านไว้แล้วจาก closure
                                 # Navigate ไปที่ Link_conpany
                                 if link_company:
+                                    self.link_company = link_company
                                     try:
                                         log(f"🌐 กำลังไปที่ Link_conpany: {link_company}", "info")
                                         
@@ -526,6 +531,7 @@ class PeakEngineBot:
                                 # Navigate ไปที่ Link_receipt (แยก try-except เพื่อให้ทำงานต่อได้แม้ Link_conpany จะมีปัญหา)
                                 log(f"🔍 ตรวจสอบ link_receipt: {repr(link_receipt)}", "info")
                                 if link_receipt:
+                                    self.link_receipt = link_receipt
                                     try:
                                         log(f"🌐 กำลังไปที่ Link_receipt: {link_receipt}", "info")
                                         
@@ -678,8 +684,17 @@ class PeakEngineBot:
                     "plus_clicked": [],
                     "selected_existing": [],
                     "validation": [],
-                    "receipt_links": []
+                    "receipt_links": [],
+                    "not_found_contacts": []
                 }
+                anonymous_categories = {
+                    re.sub(r"\s+", "", text.casefold())
+                    for text in [
+                        "ลูกค้าไม่ประสงค์ออกนาม/ยอดต่างเข้าลูกค้า",
+                        "ลูกค้าไม่ประสงค์ออกนาม/ภาษีปกติ"
+                    ]
+                }
+                anonymous_placeholder = "ลูกค้าไม่ประสงค์ออกนาม"
 
                 for idx, value in enumerate(clean_values, 1):
                     try:
@@ -688,7 +703,30 @@ class PeakEngineBot:
                         except Exception:
                             log("⚠️ ไม่สามารถรอให้ช่องเลขที่เอกสารถูกโหลดได้ภายในเวลาที่กำหนด", "warning")
                         current_row_key = clean_row_keys[idx - 1] if idx - 1 < len(clean_row_keys) else None
-                        log(f"✏️ ({idx}/{len(clean_values)}) กำลังกรอกเลขทะเบียน: {value}", "info")
+                        reg_info = None
+                        if current_row_key and row_payload_map:
+                            reg_info = row_payload_map.get(current_row_key)
+                        if not reg_info and reg_info_map:
+                            reg_info = reg_info_map.get(value)
+
+                        work_category_raw = ""
+                        if reg_info:
+                            work_category_raw = (
+                                reg_info.get("work_category")
+                                or (reg_info.get("row") or {}).get("work_category")
+                                or (reg_info.get("row") or {}).get("ประเภทการทำงาน")
+                                or ""
+                            )
+                        work_category_cf = work_category_raw.casefold()
+                        normalized_work_category = re.sub(r"\s+", "", work_category_cf) if work_category_raw else ""
+                        is_anonymous_fill = (
+                            normalized_work_category in anonymous_categories
+                            or ("ลูกค้าไม่ประสงค์ออกนาม" in work_category_cf)
+                        )
+                        value_to_fill = anonymous_placeholder if is_anonymous_fill else value
+                        log_id_display = value_to_fill if is_anonymous_fill else value
+                        log(f"✏️ ({idx}/{len(clean_values)}) กำลังกรอกเลขทะเบียน: {log_id_display}", "info")
+
                         input_element = await self.page.wait_for_selector(field_selector, timeout=5000)
                         await input_element.click()
                         try:
@@ -696,46 +734,66 @@ class PeakEngineBot:
                         except Exception:
                             pass
                         await asyncio.sleep(0.1)
-                        await input_element.fill(value)
-                        log(f"✅ กรอก {value} สำเร็จ", "success")
+                        await input_element.fill(value_to_fill)
+                        log(f"✅ กรอก {value_to_fill} สำเร็จ", "success")
                         await asyncio.sleep(0.5)
                         results["success"] += 1
                         results["processed"].append(value)
                         if current_row_key:
                             results["processed_row_keys"].append(current_row_key)
-                        reg_info = None
-                        if current_row_key and row_payload_map:
-                            reg_info = row_payload_map.get(current_row_key)
-                        if not reg_info and reg_info_map:
-                            reg_info = reg_info_map.get(value)
                         dropdown_items: List[str] = []
                         non_plus_options: List[Tuple[Any, str]] = []
                         existing_selected = False
                         plus_option = None
-                        dropdown_container = None
+                        dropdown_locator = None
+                        status_text = ""
+                        not_found = False
+                        success_found = False
+
+                        await asyncio.sleep(0.1)
+                        try:
+                            await self.page.wait_for_function(
+                                """() => {
+                                    const lists = Array.from(document.querySelectorAll('ul.ui-autocomplete'));
+                                    return lists.some(el => {
+                                        if (!el) return false;
+                                        const style = window.getComputedStyle(el);
+                                        if (!style || style.display === 'none') return false;
+                                        return el.querySelectorAll('li').length > 0;
+                                    });
+                                }""",
+                                timeout=3000
+                            )
+                        except Exception:
+                            pass
+
                         dropdown_selectors = [
-                            '//*[@id="ui-id-15"]',
-                            '//*[@id="ui-id-4"]',
-                            '//ul[contains(@class,"ui-autocomplete")]'
+                            '//ul[contains(@class,"ui-autocomplete") and not(contains(@style,"display: none"))]',
+                            '#ui-id-15',
+                            '#ui-id-4',
+                            'ul.ui-autocomplete'
                         ]
                         for selector in dropdown_selectors:
+                            locator_candidate = self.page.locator(selector)
                             try:
-                                dropdown_container = await self.page.wait_for_selector(selector, timeout=1500)
-                                if dropdown_container:
-                                    try:
-                                        is_visible = await dropdown_container.is_visible()
-                                    except Exception:
-                                        is_visible = True
-                                    if is_visible:
-                                        break
+                                await locator_candidate.wait_for(state='visible', timeout=1200)
+                                has_items = await locator_candidate.evaluate(
+                                    """el => Array.from(el.querySelectorAll('li')).length > 0"""
+                                )
+                                if not has_items:
+                                    continue
+                                dropdown_locator = locator_candidate
+                                break
                             except Exception:
-                                dropdown_container = None
+                                continue
 
                         plus_option_clicked = False
-                        if dropdown_container:
+                        if dropdown_locator:
                             try:
-                                option_elements = await dropdown_container.query_selector_all('li')
-                                for option in option_elements:
+                                option_locators = dropdown_locator.locator('li')
+                                option_count = await option_locators.count()
+                                for option_index in range(option_count):
+                                    option = option_locators.nth(option_index)
                                     try:
                                         option_text = await option.inner_text()
                                         cleaned_text = option_text.strip()
@@ -749,6 +807,8 @@ class PeakEngineBot:
                                         continue
 
                                 if dropdown_items:
+                                    if len(dropdown_items) > 1 and dropdown_items[0].startswith('+ เพิ่มผู้ติดต่อ') and dropdown_items[1:]:
+                                        log(f"ℹ️ พบตัวเลือกเพิ่มเติมใน dropdown: {', '.join(dropdown_items[1:3])}", "info")
                                     target_option = None
                                     target_text = None
                                     if non_plus_options:
@@ -835,36 +895,30 @@ class PeakEngineBot:
                                             log("🔍 กำลังกดปุ่ม 'ค้นหา'", "info")
                                             await search_button.click()
                                             await asyncio.sleep(0.5)
-                                            for _ in range(40):
-                                                status_text = ""
+                                            deadline = time.time() + 25
+                                            while time.time() < deadline:
                                                 try:
-                                                    status_element = await self.page.wait_for_selector('#mdccperrmsg', timeout=200)
+                                                    status_element = await self.page.wait_for_selector('#mdccperrmsg', timeout=500)
                                                     if status_element:
-                                                        status_text = (await status_element.inner_text() or "").strip()
+                                                        candidate_text = (await status_element.inner_text() or "").strip()
+                                                        if candidate_text:
+                                                            status_text = candidate_text
+                                                            break
                                                 except Exception:
-                                                    status_text = ""
-                                                if status_text and ("ไม่พบข้อมูลลูกค้า" in status_text or "ค้นหาสำเร็จ" in status_text):
-                                                    break
+                                                    pass
                                                 await asyncio.sleep(0.2)
-                                            else:
+                                            if not status_text:
                                                 log("⚠️ ไม่ได้รับสถานะตอบกลับจากปุ่มค้นหาภายในเวลาที่กำหนด", "warning")
                                     except Exception as search_error:
                                         log(f"⚠️ ไม่สามารถกดปุ่มค้นหาได้: {search_error}", "warning")
 
-                                    not_found = False
-                                    success_found = False
-                                    try:
-                                        error_element = await self.page.wait_for_selector('#mdccperrmsg', timeout=3000)
-                                        if error_element:
-                                            error_text = (await error_element.inner_text() or "").strip()
-                                            if "ไม่พบข้อมูลลูกค้า" in error_text:
-                                                not_found = True
-                                                log("ℹ️ ระบบไม่พบข้อมูลลูกค้าในฐานข้อมูล", "warning")
-                                            elif "ค้นหาสำเร็จ" in error_text:
-                                                success_found = True
-                                                log("✅ ระบบค้นหาข้อมูลลูกค้าเรียบร้อย", "success")
-                                    except Exception:
-                                        pass
+                                    if status_text:
+                                        if "ไม่พบข้อมูลลูกค้า" in status_text:
+                                            not_found = True
+                                            log("ℹ️ ระบบไม่พบข้อมูลลูกค้าในฐานข้อมูล", "warning")
+                                        elif "ค้นหาสำเร็จ" in status_text:
+                                            success_found = True
+                                            log("✅ ระบบค้นหาข้อมูลลูกค้าเรียบร้อย", "success")
 
                                     if plus_option_clicked:
                                         if not_found and reg_info:
@@ -917,6 +971,33 @@ class PeakEngineBot:
                                     results["receipt_links"].append(receipt_record)
                             else:
                                 log("ℹ️ ไม่มีข้อมูลจาก Excel สำหรับดำเนินการต่อ", "info")
+                        if not_found:
+                            company_name_for_log = ""
+                            if reg_info:
+                                company_name_for_log = (
+                                    reg_info.get("company_name_display")
+                                    or reg_info.get("company_name")
+                                    or (reg_info.get("row") or {}).get("ชื่อบริษัท/บุคคล")
+                                    or (reg_info.get("row") or {}).get("ชื่อบริษัทจาก DBD")
+                                    or (reg_info.get("dbd_info") or {}).get("ชื่อบริษัท")
+                                )
+                            if not company_name_for_log and current_row_key and row_payload_map:
+                                payload_entry = row_payload_map.get(current_row_key, {})
+                                company_name_for_log = (
+                                    payload_entry.get("company_name_display")
+                                    or payload_entry.get("company_name")
+                                    or payload_entry.get("dbd_company_name")
+                                )
+                            log(f"📝 บันทึก '{company_name_for_log or value}' ว่าไม่พบข้อมูลในระบบ PEAK", "warning")
+                            results["not_found_contacts"].append({
+                                "registration": value,
+                                "company_name": company_name_for_log or "",
+                                "row_key": current_row_key,
+                                "message": status_text,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                        if idx < len(clean_values) and self.link_receipt:
+                            await self._navigate_to_receipt_page(log)
                         await asyncio.sleep(0.2)
                     except Exception as e:
                         error_msg = str(e)
@@ -1431,12 +1512,13 @@ class PeakEngineBot:
         row_data.setdefault("amount", info.get("amount"))
         row_data.setdefault("date", info.get("date"))
         await self._fill_tarremark(row_data, log)
-        await self._fill_product_template(log)
+        await self._fill_product_template(row_data, log)
         category_ok = await self._apply_tax_settings(row_data, log)
         if category_ok is False:
             log("ℹ️ ข้ามรายการนี้เนื่องจากประเภทการทำงานอยู่ในรายการข้าม", "info")
             return None
         await self._select_bank_account(row_data, log)
+        await self._fill_payment_allocation(row_data, log)
         await self._submit_receipt(log)
         await asyncio.sleep(1)
         return await self._capture_receipt_document(row_data, log)
@@ -1481,41 +1563,56 @@ class PeakEngineBot:
         except Exception as e:
             log(f"⚠️ ไม่สามารถกรอกวันที่ออกเอกสาร: {e}", "warning")
 
-    async def _fill_product_template(self, log: Callable[[str, str], None]) -> None:
+    async def _fill_product_template(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> None:
         try:
             product_input = await self.page.wait_for_selector('#iptproducttemplateid1', timeout=2000)
             if not product_input:
                 log("⚠️ ไม่พบช่องกรอกสินค้า/บริการ", "warning")
                 return
             await product_input.click()
-            await product_input.fill("P00001")
+            product_code = self._normalize_component(
+                row_data.get("product_code")
+                or row_data.get("รหัสสินค้า")
+                or row_data.get("ProductCode")
+                or "P00001"
+            )
+            if not product_code:
+                product_code = "P00001"
+            await product_input.fill(product_code)
             await asyncio.sleep(0.3)
 
             product_selectors = [
-                '//ul[contains(@class,"ui-autocomplete")]/li[contains(@id,"ui-id") and contains(.,"P00001")]',
-                '//li[contains(@class,"ui-menu-item") and contains(.,"P00001")]'
+                f'//ul[contains(@class,"ui-autocomplete")]/li[contains(@id,"ui-id") and contains(.,"{product_code}")]',
+                f'//li[contains(@class,"ui-menu-item") and contains(.,"{product_code}")]'
             ]
             for selector in product_selectors:
                 try:
                     option = await self.page.wait_for_selector(selector, timeout=1000)
                     if option:
                         await option.click()
-                        log("✅ เลือกสินค้า/บริการ 'P00001 - ไลฟ์สดสินค้าเทศกาลเจนนี่'", "success")
+                        log(f"✅ เลือกสินค้า/บริการ '{product_code}'", "success")
                         break
                 except Exception:
                     continue
             else:
-                log("⚠️ ไม่พบรายการ 'P00001' ใน dropdown สินค้า/บริการ", "warning")
+                log(f"⚠️ ไม่พบรายการ '{product_code}' ใน dropdown สินค้า/บริการ", "warning")
                 return
 
-            desired_description = "ไลฟ์สดสินค้าเทศกาลเจนนี่"
+            desired_description = self._normalize_component(
+                row_data.get("product_description")
+                or row_data.get("รายละเอียดสินค้า")
+                or row_data.get("คำอธิบายสำหรับสินค้า")
+                or row_data.get("คำอธิบาย")
+                or row_data.get("description")
+                or row_data.get("work_category")
+                or "ไลฟ์สดสินค้าเทศกาลเจนนี่"
+            )
             try:
                 description_area = await self.page.wait_for_selector('#iptdescription1', timeout=2000)
                 if description_area:
-                    desired_description = "ไลฟ์สดสินค้าเทศกาลเจนนี่"
-
                     async def apply_description() -> bool:
-                        for attempt in range(3):
+                        target_text = desired_description or ""
+                        for pass_idx in range(2):
                             await description_area.click()
                             try:
                                 await description_area.press("Control+A")
@@ -1524,8 +1621,11 @@ class PeakEngineBot:
                                     await description_area.press("Meta+A")
                                 except Exception:
                                     pass
-                            await description_area.press("Delete")
-                            await description_area.fill(desired_description)
+                            try:
+                                await description_area.press("Backspace")
+                            except Exception:
+                                pass
+                            await description_area.fill(target_text)
                             try:
                                 await self.page.evaluate(
                                     """(value) => {
@@ -1536,29 +1636,26 @@ class PeakEngineBot:
                                             el.dispatchEvent(new Event('change', { bubbles: true }));
                                         }
                                     }""",
-                                    desired_description
+                                    target_text
                                 )
                             except Exception:
                                 pass
+                            await asyncio.sleep(0.5)
 
-                            current_value = ""
-                            try:
-                                current_value = await description_area.input_value()
-                            except Exception:
-                                current_value = await self.page.evaluate(
-                                    """() => {
-                                        const el = document.querySelector('#iptdescription1');
-                                        return el ? el.value || '' : '';
-                                    }"""
-                                )
+                        current_value = ""
+                        try:
+                            current_value = await description_area.input_value()
+                        except Exception:
+                            current_value = await self.page.evaluate(
+                                """() => {
+                                    const el = document.querySelector('#iptdescription1');
+                                    return el ? el.value || '' : '';
+                                }"""
+                            )
 
-                            if current_value.strip() == desired_description:
-                                log("✅ ปรับรายละเอียดสินค้าเป็น 'ไลฟ์สดสินค้าเทศกาลเจนนี่'", "success")
-                                return True
-
-                            if attempt < 2:
-                                log("⚠️ รายละเอียดสินค้ายังไม่ตรง รอ 0.5 วินาทีแล้วลองอีกครั้ง", "warning")
-                                await asyncio.sleep(0.5)
+                        if current_value.strip() == desired_description:
+                            log(f"✅ ปรับรายละเอียดสินค้าเป็น '{desired_description}'", "success")
+                            return True
 
                         log("❌ ไม่สามารถตั้งรายละเอียดสินค้าให้ตรงกับค่าที่ต้องการได้", "error")
                         return False
@@ -1610,19 +1707,34 @@ class PeakEngineBot:
         work_category = self._normalize_component(row_data.get("work_category"))
         if not work_category:
             work_category = self._normalize_component(row_data.get("ประเภทการทำงาน"))
-
-        skip_categories = {"", "-", "ไม่มีประเภทงาน", "เปิดบิลแล้ว", "เปิดบิลเอง", "บอทไม่ทำงาน"}
-        valid_category_map = {
+        normalized_category = ""
+        work_category_casefold = work_category.casefold()
+        if work_category:
+            normalized_category = re.sub(r"\s+", "", work_category_casefold)
+ 
+        raw_skip_categories = {"", "-", "ไม่มีประเภทงาน", "เปิดบิลแล้ว", "เปิดบิลเอง", "บอทไม่ทำงาน"}
+        skip_categories = {re.sub(r"\s+", "", item.casefold()) for item in raw_skip_categories}
+        category_alias_map_raw = {
             "ภาษีปกติ": "standard",
-            "หักณที่จ่าย": "withholding"
+            "หักณที่จ่าย": "withholding",
+            "ยอดต่างเข้าลูกหนี้": "debtor_diff",
+            "ลูกค้าไม่ประสงค์ออกนาม/ยอดต่างเข้าลูกค้า": "debtor_diff",
+            "ลูกค้าไม่ประสงค์ออกนาม/ภาษีปกติ": "standard"
         }
-
-        normalized_category = work_category.replace(" ", "").lower() if work_category else ""
+        valid_category_map = {
+            re.sub(r"\s+", "", key.casefold()): value
+            for key, value in category_alias_map_raw.items()
+        }
+ 
         if normalized_category in skip_categories:
             log(f"ℹ️ ประเภทการทำงาน '{work_category or 'ว่าง'}' อยู่ในรายการข้าม", "info")
             return False
-
         category_type = valid_category_map.get(normalized_category)
+        if not category_type and "ลูกค้าไม่ประสงค์ออกนาม" in work_category_casefold:
+            if "ยอดต่าง" in work_category_casefold or "ลูกค้า" in work_category_casefold:
+                category_type = "debtor_diff"
+            elif "ภาษีปกติ" in work_category_casefold:
+                category_type = "standard"
         if not category_type:
             raise RuntimeError(f"พบประเภทการทำงานที่ไม่รองรับ: {work_category or 'ว่าง'}")
 
@@ -1639,11 +1751,13 @@ class PeakEngineBot:
             log("⚠️ ไม่พบยอดเงินสำหรับตั้งราคาสินค้า", "warning")
             return False
 
+        row_data["_amount_numeric"] = amount_numeric
         amount_to_fill = amount_numeric
         if category_type == "withholding":
             amount_to_fill = amount_numeric / 1.04
 
         formatted_price = f"{amount_to_fill:.2f}"
+        row_data["_price_amount"] = amount_to_fill
 
         try:
             price_input = await self.page.wait_for_selector('#iptprice1', timeout=2000)
@@ -1652,6 +1766,7 @@ class PeakEngineBot:
                 for attempt in range(1, 4):
                     try:
                         await price_input.click()
+                        await asyncio.sleep(0.05)
                     except Exception:
                         pass
                     try:
@@ -1662,7 +1777,7 @@ class PeakEngineBot:
                         except Exception:
                             pass
                     try:
-                        await price_input.fill("")
+                        await price_input.press("Delete")
                     except Exception:
                         pass
                     await price_input.fill(formatted_price)
@@ -1680,7 +1795,7 @@ class PeakEngineBot:
                         )
                     except Exception:
                         pass
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(1)
                     try:
                         current_value = await price_input.input_value()
                     except Exception:
@@ -1705,11 +1820,16 @@ class PeakEngineBot:
                         log("✅ คลิกช่องรายละเอียดสินค้า (#iptdescription1) หลังตั้งราคา", "success")
                 except Exception as desc_click_error:
                     log(f"⚠️ ไม่สามารถคลิกช่องรายละเอียดสินค้า: {desc_click_error}", "warning")
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
             else:
                 log("⚠️ ไม่พบช่องราคา (#iptprice1)", "warning")
         except Exception as price_error:
             log(f"⚠️ ไม่สามารถตั้งราคาสินค้า: {price_error}", "warning")
+
+        vat_amount = round(amount_to_fill * 0.07, 2)
+        row_data["_vat_amount"] = vat_amount
+        if category_type == "debtor_diff":
+            log(f"ℹ️ คำนวณภาษีมูลค่าเพิ่ม 7% ได้ {vat_amount:,.2f}", "info")
 
         try:
             tax_select = await self.page.wait_for_selector('#ddltaxstatus', timeout=2000)
@@ -1735,7 +1855,7 @@ class PeakEngineBot:
         except Exception as tax_error:
             log(f"⚠️ ไม่สามารถเปลี่ยนสถานะภาษี: {tax_error}", "warning")
 
-        if category_type == "withholding":
+        if category_type in ("withholding", "debtor_diff"):
             try:
                 vat_select = await self.page.wait_for_selector('#ddlvattypeid1', timeout=2000)
                 if vat_select:
@@ -1746,6 +1866,7 @@ class PeakEngineBot:
             except Exception as vat_error:
                 log(f"⚠️ ไม่สามารถตั้งประเภทภาษีมูลค่าเพิ่ม: {vat_error}", "warning")
 
+        if category_type == "withholding":
             wht_dropdown_selectors = [
                 '#whtDropDown1',
                 '//div[@id="whtDropDown1"]',
@@ -1789,6 +1910,263 @@ class PeakEngineBot:
                 log("⚠️ ไม่พบ dropdown อัตราหัก ณ ที่จ่าย", "warning")
 
         return True
+ 
+    async def _fill_payment_allocation(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> None:
+        work_category = self._normalize_component(row_data.get("work_category")) or self._normalize_component(row_data.get("ประเภทการทำงาน"))
+        normalized_category = ""
+        if work_category:
+            normalized_category = re.sub(r"\s+", "", work_category.casefold())
+        debtor_diff_categories = {
+            re.sub(r"\s+", "", text.casefold())
+            for text in ["ยอดต่างเข้าลูกหนี้", "ลูกค้าไม่ประสงค์ออกนาม/ยอดต่างเข้าลูกค้า"]
+        }
+        if normalized_category not in debtor_diff_categories:
+            return
+
+        payment_amount = row_data.get("_price_amount")
+        if payment_amount is None:
+            payment_amount = self._parse_amount_value(row_data.get("amount")) or self._parse_amount_value(row_data.get("จำนวนเงิน"))
+        if payment_amount is None:
+            log("⚠️ ไม่พบยอดสำหรับกรอกในการชำระเงิน (#iptpaymentamount1)", "warning")
+            return
+
+        vat_amount_value = row_data.get("_vat_amount")
+        if vat_amount_value is None and payment_amount is not None:
+            vat_amount_value = round(float(payment_amount) * 0.07, 2)
+
+        formatted_payment = f"{payment_amount:.2f}"
+        success_balance = False
+        max_attempts = 2
+        for iteration in range(max_attempts):
+            if iteration > 0:
+                log("🔁 ตรวจสอบยอดชำระและผังบัญชีซ้ำอีกครั้งก่อนอนุมัติ", "info")
+
+            try:
+                payment_input = await self.page.wait_for_selector('#iptpaymentamount1', timeout=3000)
+                if payment_input:
+                    for attempt in range(1, 4):
+                        try:
+                            await payment_input.click()
+                        except Exception:
+                            pass
+                        try:
+                            await payment_input.press("Control+A")
+                        except Exception:
+                            try:
+                                await payment_input.press("Meta+A")
+                            except Exception:
+                                pass
+                        try:
+                            await payment_input.fill("")
+                        except Exception:
+                            pass
+                        await payment_input.fill(formatted_payment)
+                        try:
+                            await self.page.evaluate(
+                                """(value) => {
+                                    const el = document.querySelector('#iptpaymentamount1');
+                                    if (el) {
+                                        el.value = value;
+                                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                                    }
+                                }""",
+                                formatted_payment
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.2)
+                        try:
+                            current_value = await payment_input.input_value()
+                        except Exception:
+                            current_value = ""
+                        if current_value and current_value.replace(",", "").strip():
+                            break
+                        if attempt < 3:
+                            log("ℹ️ ยอดช่องชำระเงินยังว่าง กำลังพยายามใหม่อีกครั้ง", "info")
+                    log(f"✅ กรอกจำนวนเงินชำระเป็น {formatted_payment}", "success")
+                else:
+                    log("⚠️ ไม่พบช่องชำระเงิน (#iptpaymentamount1)", "warning")
+                    if iteration == 0:
+                        return
+                    continue
+            except Exception as payment_error:
+                log(f"⚠️ ไม่สามารถกรอกจำนวนเงินชำระ: {payment_error}", "warning")
+                if iteration == 0:
+                    return
+                continue
+
+            if iteration == 0:
+                add_button_selectors = [
+                    '#paymentChartAccountButtonAdd',
+                    'a#paymentChartAccountButtonAdd',
+                    '//a[@id="paymentChartAccountButtonAdd"]'
+                ]
+                add_button_clicked = False
+                for selector in add_button_selectors:
+                    try:
+                        if selector.startswith('//'):
+                            add_button = self.page.locator(selector).first
+                            await add_button.wait_for(state='visible', timeout=1500)
+                        else:
+                            add_button = await self.page.wait_for_selector(selector, timeout=1500, state='visible')
+                        if add_button:
+                            await add_button.click()
+                            add_button_clicked = True
+                            log("➕ คลิก '+ เพิ่มค่าธรรมเนียมหรือรายการปรับปรุงอื่น' เพื่อเปิดผังบัญชี", "info")
+                            await asyncio.sleep(0.5)
+                            break
+                    except Exception:
+                        continue
+                if not add_button_clicked:
+                    log("ℹ️ ไม่พบปุ่ม '+ เพิ่มค่าธรรมเนียมหรือรายการปรับปรุงอื่น' หรือปุ่มอาจถูกเปิดอยู่แล้ว", "info")
+            else:
+                log("ℹ️ รอบตรวจซ้ำ: ใช้ผังบัญชีที่เปิดไว้เดิม", "info")
+
+            chart_field_selector = '//*[@id="pmChartAccountrow1"]/td[3]/div'
+            account_text = "ลูกหนี้ค้างรับ"
+            try:
+                chart_field = self.page.locator(chart_field_selector).first
+                await chart_field.wait_for(state='visible', timeout=3000)
+                await chart_field.click()
+                await asyncio.sleep(0.2)
+                search_input = chart_field.locator('input')
+                if await search_input.count() > 0:
+                    try:
+                        await search_input.fill("")
+                        await search_input.type(account_text, delay=30)
+                    except Exception:
+                        await self.page.keyboard.type(account_text, delay=30)
+                else:
+                    await self.page.keyboard.type(account_text, delay=30)
+                await asyncio.sleep(0.3)
+            except Exception as chart_error:
+                log(f"⚠️ ไม่สามารถเปิดหรือกรอกช่องผังบัญชี: {chart_error}", "warning")
+                return
+
+            try:
+                option_locator = self.page.locator(
+                    '//div[contains(@class,"menu") and contains(@class,"visible")]//div[contains(@class,"item") and contains(text(),"ลูกหนี้ค้างรับ")]'
+                ).first
+                await option_locator.wait_for(state='visible', timeout=3000)
+                await option_locator.click()
+                log("✅ เลือกบัญชี 'ลูกหนี้ค้างรับ' สำเร็จ", "success")
+            except Exception as option_error:
+                log(f"⚠️ ไม่พบตัวเลือกบัญชี 'ลูกหนี้ค้างรับ': {option_error}", "warning")
+                if iteration == 0:
+                    return
+                continue
+
+            if vat_amount_value is not None:
+                formatted_vat = f"{float(vat_amount_value):.2f}"
+                try:
+                    vat_input = await self.page.wait_for_selector('#iptPaymentChartAccountAmount1', timeout=3000)
+                    if vat_input:
+                        for attempt in range(1, 4):
+                            try:
+                                await vat_input.click()
+                            except Exception:
+                                pass
+                            try:
+                                await vat_input.press("Control+A")
+                            except Exception:
+                                try:
+                                    await vat_input.press("Meta+A")
+                                except Exception:
+                                    pass
+                            try:
+                                await vat_input.fill("")
+                            except Exception:
+                                pass
+                            await vat_input.fill(formatted_vat)
+                            try:
+                                await self.page.evaluate(
+                                    """(value) => {
+                                        const el = document.querySelector('#iptPaymentChartAccountAmount1');
+                                        if (el) {
+                                            el.value = value;
+                                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                                        }
+                                    }""",
+                                    formatted_vat
+                                )
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.2)
+                            try:
+                                current_value = await vat_input.input_value()
+                            except Exception:
+                                current_value = ""
+                            if current_value and current_value.replace(",", "").strip():
+                                break
+                        log(f"✅ กรอกยอดภาษีมูลค่าเพิ่มเป็น {formatted_vat}", "success")
+                    else:
+                        log("⚠️ ไม่พบช่องกรอกยอดผังบัญชี (#iptPaymentChartAccountAmount1)", "warning")
+                        if iteration == 0:
+                            return
+                except Exception as vat_error:
+                    log(f"⚠️ ไม่สามารถกรอกยอดภาษีมูลค่าเพิ่ม: {vat_error}", "warning")
+                    if iteration == 0:
+                        return
+            try:
+                remain_element = await self.page.wait_for_selector('#lbremainpaymentamount', timeout=2000)
+                if remain_element:
+                    remain_text = (await remain_element.inner_text() or "").strip()
+                    cleaned_remain = remain_text.replace(",", "")
+                    success_balance = cleaned_remain in {"0", "0.00", "0.0", "0.000"}
+                    if not success_balance and iteration < max_attempts - 1:
+                        log(f"⚠️ พบยอดคงเหลือ {remain_text} ไม่ใช่ 0.00 จะลองกรอกซ้ำอีกครั้ง", "warning")
+                else:
+                    success_balance = True
+            except Exception:
+                success_balance = True
+            if success_balance:
+                break
+        if not success_balance:
+            log("⚠️ ยอดคงเหลือยังไม่เป็น 0.00 หลังจากพยายามซ้ำ", "warning")
+
+    async def _navigate_to_receipt_page(self, log: Callable[[str, str], None], wait_for_contact_field: bool = True) -> None:
+        if not self.link_receipt:
+            log("ℹ️ ไม่มี Link_receipt สำหรับรีเซ็ตหน้าใบเสร็จ", "info")
+            return
+        try:
+            log(f"🔄 กำลังรีเซ็ตหน้าใบเสร็จ: {self.link_receipt}", "info")
+            await self.page.goto(self.link_receipt, wait_until='domcontentloaded', timeout=30000)
+            await self._ensure_maximized()
+            if wait_for_contact_field:
+                try:
+                    await self.page.wait_for_selector('//*[@id="iptcontactname"]', timeout=5000)
+                except Exception:
+                    pass
+            log("✅ รีเซ็ตหน้าใบเสร็จเรียบร้อย", "success")
+        except Exception as e:
+            log(f"⚠️ ไม่สามารถรีเซ็ตหน้าใบเสร็จ: {e}", "warning")
+
+    async def _ensure_maximized(self) -> None:
+        if not self.page:
+            return
+        await self._maximize_window(self.page)
+
+    async def _maximize_window(self, page) -> None:
+        if not page:
+            return
+        try:
+            session = await page.context.new_cdp_session(page)
+            bounds_info = await session.send("Browser.getWindowForTarget")
+            window_id = bounds_info.get("windowId")
+            if window_id is not None:
+                await session.send(
+                    "Browser.setWindowBounds",
+                    {
+                        "windowId": window_id,
+                        "bounds": {
+                            "windowState": "maximized"
+                        }
+                    }
+                )
+        except Exception:
+            pass
 
     async def _select_bank_account(self, row_data: Dict[str, Any], log: Callable[[str, str], None]) -> None:
         log("🔽 กำลังเลือกบัญชีธนาคาร...", "info")

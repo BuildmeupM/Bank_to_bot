@@ -2989,6 +2989,8 @@ def render_receipt_bot_page():
                         }
 
         positive_rows: List[Dict[str, Any]] = []
+        person_placeholder_counter = 0
+        target_work_category_key = re.sub(r"\s+", "", "ยอดต่างเข้าลูกหนี้".casefold())
         if df_source_for_filters is not None and not df_source_for_filters.empty:
             for idx, row in df_source_for_filters.iterrows():
                 amount_numeric = get_row_amount(row)
@@ -3009,6 +3011,17 @@ def render_receipt_bot_page():
                 status_value = normalize_status_value(row.get("สถานะข้อมูล DBD", ""))
 
                 transfer_type_value = normalize_transfer_type(row.get("ประเภทผู้ส่งโอน", ""))
+                is_person_transfer = transfer_type_value == "บุคคล"
+
+                dbd_not_found = (
+                    status_value in {"ไม่มีข้อมูล", "ค่าว่าง"}
+                    or "ไม่พบข้อมูล" in dbd_info_raw_value.lower()
+                    or not dbd_info_dict
+                )
+
+                if not reg_norm and is_person_transfer and dbd_not_found:
+                    person_placeholder_counter += 1
+                    reg_norm = f"0{str(person_placeholder_counter).zfill(12)}"
 
                 company_value_raw = (
                     row.get("ชื่อบริษัทจาก DBD")
@@ -3018,11 +3031,24 @@ def render_receipt_bot_page():
                 )
                 company_value = str(company_value_raw).strip() or "-"
 
+                if is_person_transfer and dbd_not_found:
+                    company_value = "ลูกค้าไม่ประสงค์ออกนาม"
+
                 work_category_raw = row.get("ประเภทการทำงาน")
                 work_category_value = clean_text(work_category_raw) or "-"
-                normalized_work_category = work_category_value.strip().lower()
-                skip_work_categories = {"", "-", "ไม่มีประเภทงาน", "เปิดบิลแล้ว", "เปิดบิลเอง", "บอทไม่ทำงาน"}
-                valid_work_categories = {"ภาษีปกติ", "หัก ณ ที่จ่าย"}
+                normalized_work_category = re.sub(r"\s+", "", work_category_value.casefold())
+                raw_skip_categories = {"", "-", "ไม่มีประเภทงาน", "เปิดบิลแล้ว", "เปิดบิลเอง", "บอทไม่ทำงาน"}
+                skip_work_categories = {re.sub(r"\s+", "", item.casefold()) for item in raw_skip_categories}
+                raw_valid_categories = {
+                    "ภาษีปกติ",
+                    "หัก ณ ที่จ่าย",
+                    "ยอดต่างเข้าลูกหนี้",
+                    "ลูกหนี้ไม่ประสงค์ออกนาม/ภาษีปกติ",
+                    "ลูกค้าไม่ประสงค์ออกนาม/ยอดต่างเข้าลูกหนี้",
+                    "ลูกค้าไม่ประสงค์ออกนาม/ยอดต่างเข้าลูกค้า",
+                    "ลูกค้าไม่ประสงค์ออกนาม/ภาษีปกติ"
+                }
+                valid_work_categories = {re.sub(r"\s+", "", item.casefold()) for item in raw_valid_categories}
 
                 if normalized_work_category in skip_work_categories:
                     continue
@@ -3037,6 +3063,10 @@ def render_receipt_bot_page():
                 date_value = format_date_display(raw_date_value)
 
                 amount_display = format_amount_display(row.get("จำนวนเงิน"), amount_numeric)
+                vat_amount_value: Optional[float] = None
+                if amount_numeric is not None and target_work_category_key in normalized_work_category:
+                    vat_amount_value = round(amount_numeric * 0.07, 2)
+                vat_amount_display = f"{vat_amount_value:,.2f}" if vat_amount_value is not None else "-"
 
                 description_value_raw = str(row.get("คำอธิบาย", "")).strip()
                 description_value = description_value_raw if description_value_raw.lower() not in {"nan", "none", ""} else "-"
@@ -3047,12 +3077,16 @@ def render_receipt_bot_page():
                     dbd_info_dict.get("ชื่อบริษัท"),
                     dbd_info_dict.get("ชื่อกิจการ")
                 )
+                if is_person_transfer and dbd_not_found:
+                    dbd_company_name = "ลูกค้าไม่ประสงค์ออกนาม"
                 dbd_registration_text = pick_first_text(
                     row.get("เลขทะเบียนจาก DBD"),
                     row.get("เลขทะเบียน"),
                     row.get("เลขทะเบียนนิติบุคคล"),
                     dbd_info_dict.get("เลขทะเบียน")
                 )
+                if is_person_transfer and dbd_not_found and not clean_text(dbd_registration_text):
+                    dbd_registration_text = reg_norm
                 dbd_business_type = pick_first_text(
                     row.get("ประเภทธุรกิจจาก DBD"),
                     row.get("ประเภทธุรกิจ"),
@@ -3147,6 +3181,8 @@ def render_receipt_bot_page():
                     "date": date_value,
                     "amount": amount_display,
                     "amount_numeric": amount_numeric,
+                    "vat_amount": vat_amount_display,
+                    "vat_amount_numeric": vat_amount_value,
                     "description": description_value,
                     "dbd_info_raw": dbd_info_raw_value or "-",
                     "dbd_company_name": dbd_company_name or "-",
@@ -3165,11 +3201,18 @@ def render_receipt_bot_page():
                     "source_index": idx
                 })
 
-        if not positive_rows:
-            st.warning("⚠️ ไม่มีเลขทะเบียนที่มียอดเงินเป็นบวกพร้อมสำหรับขั้นตอนที่ 2")
-            return
-
         df_positive_rows = pd.DataFrame(positive_rows)
+        if df_positive_rows.empty:
+            st.info("ไม่มีรายการที่ผ่านเงื่อนไขเบื้องต้นสำหรับขั้นตอนที่ 2")
+            st.caption("""
+เงื่อนไขเบื้องต้นที่ต้องผ่าน ได้แก่:
+• จำนวนเงินต้องเป็นบวก (ระบบจะข้ามแถวที่ยอดเป็นศูนย์หรือติดลบ)
+• ประเภทการทำงานต้องอยู่ในรายการที่รองรับ: ภาษีปกติ, หัก ณ ที่จ่าย, ยอดต่างเข้าลูกหนี้,
+  ลูกหนี้ไม่ประสงค์ออกนาม/ภาษีปกติ, ลูกค้าไม่ประสงค์ออกนาม/ยอดต่างเข้าลูกหนี้
+• ต้องมีเลขทะเบียน 13 หลัก (หรือในกรณีผู้ส่งโอนเป็นบุคคลและ DBD ไม่พบข้อมูล ระบบจะสร้างเลขทะเบียนชั่วคราวขึ้นให้)
+หากต้องการให้รายการผ่านขั้นตอนนี้ โปรดตรวจสอบให้ข้อมูลตรงตามเงื่อนไขข้างต้น
+""")
+            return
         total_positive = len(df_positive_rows)
         unique_positive = df_positive_rows["registration"].nunique()
 
@@ -3282,31 +3325,80 @@ def render_receipt_bot_page():
         )
 
         filter_mask = pd.Series(True, index=df_positive_rows.index)
+        status_mask = pd.Series(True, index=df_positive_rows.index)
+        type_mask = pd.Series(True, index=df_positive_rows.index)
+        search_mask = pd.Series(True, index=df_positive_rows.index)
+
         if selected_step2_statuses:
-            normalized_selected = [
-                "ลูกค้าไม่ประสงค์ออกนาม" if status == "ไม่มีข้อมูล" else status
-                for status in selected_step2_statuses
-            ]
-            filter_mask &= (
-                df_positive_rows["dbd_status"].isin(selected_step2_statuses)
-                & ~df_positive_rows["dbd_status"].astype(str).str.contains("ไม่มีข้อมูล", na=False)
-            )
+            allow_missing_status = "ไม่มีข้อมูล" in selected_step2_statuses
+            status_mask = df_positive_rows["dbd_status"].isin(selected_step2_statuses)
+            if not allow_missing_status:
+                status_mask &= ~df_positive_rows["dbd_status"].astype(str).str.contains("ไม่มีข้อมูล", na=False)
+            filter_mask &= status_mask
 
         if selected_step2_types and available_step2_types:
-            filter_mask &= df_positive_rows["transfer_type"].isin(selected_step2_types)
+            type_mask = df_positive_rows["transfer_type"].isin(selected_step2_types)
+            filter_mask &= type_mask
 
         if step2_search_keyword:
             keyword_lower = step2_search_keyword.lower()
-            filter_mask &= (
+            search_mask = (
                 df_positive_rows["registration"].str.contains(keyword_lower, case=False, na=False)
                 | df_positive_rows["company_name"].str.contains(keyword_lower, case=False, na=False)
                 | df_positive_rows["description"].str.contains(keyword_lower, case=False, na=False)
             )
+            filter_mask &= search_mask
 
         df_step2_filtered = df_positive_rows[filter_mask].copy().reset_index(drop=True)
 
         if df_step2_filtered.empty:
             st.warning("⚠️ ไม่มีเลขทะเบียนที่ตรงกับเงื่อนไขตัวกรองขั้นที่ 2")
+            total_candidates = len(df_positive_rows)
+            st.info(f"จำนวนรายการก่อนกรอง: {total_candidates}")
+
+            if selected_step2_statuses:
+                passed_status = int(status_mask.sum())
+                st.warning(
+                    f"• เงื่อนไขสถานะที่เลือก: {', '.join(selected_step2_statuses)} "
+                    f"→ ผ่าน {passed_status} รายการ"
+                )
+                blocked_status = df_positive_rows.loc[~status_mask, ["registration", "dbd_status", "transfer_type"]].head(20)
+                if not blocked_status.empty:
+                    st.caption("ตัวอย่างรายการที่ไม่ผ่านเงื่อนไขสถานะ (แสดงสูงสุด 20 รายการ):")
+                    st.dataframe(blocked_status, use_container_width=True, hide_index=True)
+
+            if selected_step2_types:
+                passed_type = int(type_mask.sum())
+                st.warning(
+                    f"• ประเภทผู้ส่งโอนที่เลือก: {', '.join(selected_step2_types)} "
+                    f"→ ผ่าน {passed_type} รายการ"
+                )
+                blocked_type = df_positive_rows.loc[~type_mask, ["registration", "transfer_type", "dbd_status"]].head(20)
+                if not blocked_type.empty:
+                    st.caption("ตัวอย่างรายการที่ไม่ผ่านเงื่อนไขประเภทผู้ส่งโอน (แสดงสูงสุด 20 รายการ):")
+                    st.dataframe(blocked_type, use_container_width=True, hide_index=True)
+
+            if step2_search_keyword:
+                passed_search = int(search_mask.sum())
+                st.warning(
+                    f"• คำค้นหา: '{step2_search_keyword}' → พบ {passed_search} รายการที่ตรงคำค้น"
+                )
+
+            remaining_mask = status_mask & type_mask & search_mask
+            remaining_df = df_positive_rows.loc[remaining_mask, ["registration", "company_name", "dbd_status", "transfer_type"]]
+            if not remaining_df.empty:
+                st.caption("คุณสามารถยกเลิกเงื่อนไขบางส่วนเพื่อให้รายการต่อไปนี้ผ่านเข้าสู่ขั้นตอนที่ 2:")
+                st.dataframe(remaining_df.head(20), use_container_width=True, hide_index=True)
+            else:
+                st.caption("ไม่มีรายการใดผ่านทุกเงื่อนไขที่เลือกอยู่ในขณะนี้")
+                missing_reg_mask = df_positive_rows["registration"].astype(str).str.fullmatch(r"0\d{12}")
+                missing_reg_df = df_positive_rows.loc[missing_reg_mask, ["company_name", "dbd_status", "transfer_type", "amount"]]
+                if not missing_reg_df.empty:
+                    st.error(
+                        "รายการด้านล่างไม่มีเลขทะเบียนจริง (ระบบสร้างเลขบัญชีชั่วคราวขึ้นมา). "
+                        "กรุณาเพิ่มเลขทะเบียนจริงหรือเปิดให้ใช้รายการ 'ไม่มีข้อมูล' ในตัวกรองสถานะ."
+                    )
+                    st.dataframe(missing_reg_df.head(20), use_container_width=True, hide_index=True)
             return
 
         if "row_key" in df_step2_filtered.columns:
@@ -3328,7 +3420,10 @@ def render_receipt_bot_page():
         not_found_mask = raw_not_found_mask | status_not_found_mask
 
         company_display_series = df_step2_filtered["company_name"].astype(str).where(~not_found_mask, "ลูกค้าไม่ประสงค์ออกนาม")
+        person_mask = df_step2_filtered["transfer_type"].astype(str).str.strip() == "บุคคล"
+        company_display_series = company_display_series.where(~person_mask, "ลูกค้าไม่ประสงค์ออกนาม")
         status_display_series = df_step2_filtered["dbd_status"].astype(str).where(~not_found_mask, "ลูกค้าไม่ประสงค์ออกนาม")
+        status_display_series = status_display_series.where(~person_mask, "ลูกค้าไม่ประสงค์ออกนาม")
 
         df_step2_filtered["company_name_display"] = company_display_series
         df_step2_filtered["dbd_status_display"] = status_display_series
@@ -3364,6 +3459,7 @@ def render_receipt_bot_page():
             "date": "วันที่",
             "amount": "จำนวนเงิน",
             "description": "คำอธิบาย",
+            "vat_amount": "ภาษีมูลค่าเพิ่ม 7%",
             "dbd_status": "สถานะข้อมูล DBD (เดิม)",
             "dbd_status_display": "สถานะข้อมูล DBD",
             "transfer_type": "ประเภทผู้ส่งโอน",
@@ -3447,6 +3543,7 @@ def render_receipt_bot_page():
                 "work_category": "ประเภทการทำงาน",
                 "date": "วันที่",
                 "amount": "จำนวนเงิน",
+                "vat_amount": "ภาษีมูลค่าเพิ่ม 7%",
                 "description": "คำอธิบาย",
                 "dbd_status_display": "สถานะข้อมูล DBD",
                 "transfer_type": "ประเภทผู้ส่งโอน"
@@ -3557,6 +3654,8 @@ def render_receipt_bot_page():
                     "document_date_raw": step2_row_dict.get("document_date_raw") if step2_row_dict.get("document_date_raw") is not None else reg_entry.get("document_date_raw"),
                     "amount": step2_row_dict.get("amount") or reg_entry.get("amount", ""),
                     "amount_numeric": step2_row_dict.get("amount_numeric") if step2_row_dict.get("amount_numeric") is not None else reg_entry.get("amount_numeric"),
+                    "vat_amount": step2_row_dict.get("vat_amount") or reg_entry.get("vat_amount", ""),
+                    "vat_amount_numeric": step2_row_dict.get("vat_amount_numeric") if step2_row_dict.get("vat_amount_numeric") is not None else reg_entry.get("vat_amount_numeric"),
                     "dbd_raw": dbd_raw_text or reg_entry.get("dbd_raw", ""),
                     "dbd_info": dbd_parsed or reg_entry.get("dbd_info", {}),
                     "row_index": (
@@ -3582,6 +3681,8 @@ def render_receipt_bot_page():
                         "document_date_raw": step2_row_dict.get("document_date_raw"),
                         "amount": step2_row_dict.get("amount"),
                         "amount_numeric": step2_row_dict.get("amount_numeric"),
+                        "vat_amount": step2_row_dict.get("vat_amount"),
+                        "vat_amount_numeric": step2_row_dict.get("vat_amount_numeric"),
                         "dbd_raw": dbd_raw_text,
                         "dbd_info": dbd_parsed,
                         "row_index": (
@@ -3625,6 +3726,47 @@ def render_receipt_bot_page():
 
             st.write("**สัดส่วนประเภทผู้ส่งโอน (หลังกรอง)**")
             st.dataframe(type_distribution, use_container_width=True, hide_index=True)
+
+            debtor_diff_df = df_step2_filtered[
+                df_step2_filtered["work_category"]
+                .astype(str)
+                .str.replace(r"\s+", "", regex=True)
+                .str.casefold()
+                == target_work_category_key
+            ].copy()
+            if not debtor_diff_df.empty:
+                st.subheader("📌 รายการประเภท 'ยอดต่างเข้าลูกหนี้'")
+                debtor_preview_columns = [
+                    "registration",
+                    "company_name_display",
+                    "date",
+                    "amount",
+                    "vat_amount",
+                    "description",
+                    "transfer_type",
+                ]
+                available_debtor_columns = [
+                    col for col in debtor_preview_columns if col in debtor_diff_df.columns
+                ]
+                st.dataframe(
+                    debtor_diff_df[available_debtor_columns]
+                    .rename(
+                        columns={
+                            "registration": "เลขทะเบียน",
+                            "company_name_display": "ชื่อบริษัท/บุคคล",
+                            "date": "วันที่",
+                            "amount": "จำนวนเงิน",
+                            "vat_amount": "ภาษีมูลค่าเพิ่ม 7%",
+                            "description": "คำอธิบาย",
+                            "transfer_type": "ประเภทผู้ส่งโอน",
+                        }
+                    )
+                    .reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                total_vat = debtor_diff_df["vat_amount_numeric"].fillna(0).sum()
+                st.caption(f"💡 ยอดภาษีมูลค่าเพิ่มรวม: {total_vat:,.2f}")
 
             with st.expander("ดูรายการที่ DBD ไม่พบข้อมูล", expanded=False):
                 if not not_found_df.empty:
@@ -4502,6 +4644,6 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
-        
-        
+    main()                
+
+
