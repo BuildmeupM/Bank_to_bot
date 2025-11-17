@@ -3061,6 +3061,8 @@ def render_receipt_bot_page():
 
                 raw_date_value = row.get("วันที่")
                 date_value = format_date_display(raw_date_value)
+                time_value_raw = row.get("เวลา", "")
+                time_value = str(time_value_raw).strip() if time_value_raw and str(time_value_raw).lower() not in {"nan", "none", ""} else ""
 
                 amount_display = format_amount_display(row.get("จำนวนเงิน"), amount_numeric)
                 vat_amount_value: Optional[float] = None
@@ -3179,6 +3181,7 @@ def render_receipt_bot_page():
                     "document_date_raw": raw_date_value,
                     "work_category": work_category_value,
                     "date": date_value,
+                    "เวลา": time_value,
                     "amount": amount_display,
                     "amount_numeric": amount_numeric,
                     "vat_amount": vat_amount_display,
@@ -3231,6 +3234,162 @@ def render_receipt_bot_page():
         st.write("**ประเภทผู้ส่งโอน**")
         type_display_df = type_counts.rename_axis("ประเภท").reset_index(name="จำนวน")
         st.dataframe(type_display_df, height=150, hide_index=True)
+
+        # ส่วนเปรียบเทียบกับไฟล์รายงาน
+        st.subheader("📋 เปรียบเทียบกับไฟล์รายงาน")
+        st.caption("อัปโหลดไฟล์รายงานที่มีคอลัมน์ 'อ้างอิง' เพื่อกรองรายการที่ทำเสร็จแล้วออก")
+        
+        uploaded_report_file = st.file_uploader(
+            "📁 เลือกไฟล์รายงาน (Excel) ที่มีคอลัมน์ 'อ้างอิง'",
+            type=['xlsx', 'xls'],
+            help="ไฟล์รายงานควรมีคอลัมน์ 'อ้างอิง' ในรูปแบบ: DD/MM/YYYY HH:MM X####",
+            key="peakengine_report_file"
+        )
+        
+        completed_references = set()
+        if uploaded_report_file is not None:
+            try:
+                with st.spinner("กำลังอ่านไฟล์รายงาน..."):
+                    report_excel = pd.ExcelFile(uploaded_report_file)
+                    report_sheet_name = None
+                    for sheet in report_excel.sheet_names:
+                        df_temp = pd.read_excel(report_excel, sheet_name=sheet, nrows=5)
+                        if "อ้างอิง" in df_temp.columns:
+                            report_sheet_name = sheet
+                            break
+                    
+                    if report_sheet_name:
+                        df_report = pd.read_excel(report_excel, sheet_name=report_sheet_name)
+                        if "อ้างอิง" in df_report.columns:
+                            def extract_reference_key(ref_value):
+                                """แยกข้อมูลจากคอลัมน์อ้างอิง: DD/MM/YYYY HH:MM X####"""
+                                if pd.isna(ref_value):
+                                    return None
+                                ref_str = str(ref_value).strip()
+                                if not ref_str or ref_str.lower() in {"nan", "none", ""}:
+                                    return None
+                                
+                                # รูปแบบ: DD/MM/YYYY HH:MM X####
+                                parts = ref_str.split()
+                                if len(parts) >= 3:
+                                    date_part = parts[0]  # DD/MM/YYYY
+                                    time_part = parts[1]  # HH:MM
+                                    code_part = parts[2] if len(parts) > 2 else ""  # X####
+                                    
+                                    # แยกรหัส 4 หลักสุดท้าย
+                                    bank_code = ""
+                                    if code_part:
+                                        digits = "".join(ch for ch in code_part if ch.isdigit())
+                                        if len(digits) >= 4:
+                                            bank_code = digits[-4:]
+                                    
+                                    if date_part and time_part and bank_code:
+                                        # สร้าง key สำหรับเปรียบเทียบ: DD/MM/YYYY HH:MM ####
+                                        return f"{date_part} {time_part} {bank_code}"
+                                return None
+                            
+                            completed_refs = df_report["อ้างอิง"].apply(extract_reference_key).dropna().tolist()
+                            completed_references = set(completed_refs)
+                            
+                            st.success(f"✅ โหลดไฟล์รายงานสำเร็จ! พบรายการที่ทำเสร็จแล้ว {len(completed_references)} รายการ")
+                            
+                            if st.checkbox("แสดงตัวอย่างข้อมูลจากไฟล์รายงาน", key="show_report_preview"):
+                                st.dataframe(df_report.head(10), use_container_width=True)
+                        else:
+                            st.warning("⚠️ ไม่พบคอลัมน์ 'อ้างอิง' ในไฟล์รายงาน")
+                    else:
+                        st.warning("⚠️ ไม่พบชีตที่มีคอลัมน์ 'อ้างอิง' ในไฟล์รายงาน")
+            except Exception as e:
+                st.error(f"❌ เกิดข้อผิดพลาดในการอ่านไฟล์รายงาน: {str(e)}")
+        
+        # สร้าง reference key จากข้อมูลที่นำเข้า
+        def create_reference_key_from_row(row):
+            """สร้าง reference key จากข้อมูลแถว: DD/MM/YYYY HH:MM ####"""
+            date_value = row.get("date", "")
+            time_value = row.get("เวลา", "")  # ลองดึงจากคอลัมน์เวลา
+            description = row.get("description", "")
+            
+            # แยกวันที่และเวลาจาก date_value
+            date_str = ""
+            time_str = ""
+            if date_value and str(date_value).strip() and str(date_value).lower() not in {"nan", "none", "-"}:
+                date_str = str(date_value).strip()
+                # ถ้ามีเวลาใน date_value
+                if " " in date_str:
+                    parts = date_str.split()
+                    date_str = parts[0]
+                    if len(parts) > 1:
+                        time_str = parts[1]
+            
+            # ถ้ายังไม่มีเวลา ลองดึงจากคอลัมน์เวลา
+            if not time_str and time_value and str(time_value).strip() and str(time_value).lower() not in {"nan", "none", "-"}:
+                time_str = str(time_value).strip()
+            
+            # แยกรหัสธนาคาร 4 หลักสุดท้ายจากคำอธิบาย
+            bank_code = ""
+            if description and str(description).strip() and str(description).lower() not in {"nan", "none", "-"}:
+                desc_str = str(description)
+                # หา pattern X#### หรือ #### ในคำอธิบาย
+                patterns = [
+                    r'X(\d{4})',  # X####
+                    r'(\d{4})(?=\s|$)',  # #### ที่ท้ายคำ
+                    r'(\d{4})(?=\s|$|[\+\-])'  # #### ที่ท้ายคำหรือก่อนเครื่องหมาย
+                ]
+                for pattern in patterns:
+                    matches = re.findall(pattern, desc_str)
+                    if matches:
+                        bank_code = matches[-1]  # ใช้ตัวสุดท้าย
+                        break
+                
+                # ถ้ายังไม่เจอ ลองหาเลข 4 หลักสุดท้าย
+                if not bank_code:
+                    digits = "".join(ch for ch in desc_str if ch.isdigit())
+                    if len(digits) >= 4:
+                        bank_code = digits[-4:]
+            
+            if date_str and time_str and bank_code:
+                # แปลงรูปแบบวันที่เป็น DD/MM/YYYY ถ้ายังไม่ใช่
+                try:
+                    from datetime import datetime
+                    if "/" not in date_str:
+                        # ถ้าเป็นรูปแบบอื่น ลองแปลง
+                        try:
+                            dt = pd.to_datetime(date_str)
+                            date_str = dt.strftime("%d/%m/%Y")
+                        except:
+                            pass
+                    # แปลงเวลาเป็น HH:MM ถ้ายังไม่ใช่
+                    if ":" not in time_str:
+                        try:
+                            if len(time_str) >= 4:
+                                time_str = f"{time_str[:2]}:{time_str[2:4]}"
+                        except:
+                            pass
+                    
+                    return f"{date_str} {time_str} {bank_code}"
+                except:
+                    pass
+            
+            return None
+        
+        # เพิ่มคอลัมน์ reference_key ใน df_positive_rows
+        if not df_positive_rows.empty:
+            df_positive_rows = df_positive_rows.copy()
+            df_positive_rows["reference_key"] = df_positive_rows.apply(create_reference_key_from_row, axis=1)
+            
+            # กรองรายการที่ทำเสร็จแล้วออก
+            if completed_references:
+                mask_not_completed = ~df_positive_rows["reference_key"].isin(completed_references) | df_positive_rows["reference_key"].isna()
+                df_positive_rows = df_positive_rows[mask_not_completed].copy()
+                
+                completed_count = len(completed_references)
+                remaining_count = len(df_positive_rows)
+                st.info(f"📊 กรองรายการที่ทำเสร็จแล้วออก: {completed_count} รายการ • เหลือรายการที่ต้องทำ: {remaining_count} รายการ")
+                
+                # แสดงรายการที่ยังไม่ได้รัน
+                if st.checkbox("แสดงรายการที่บอทยังไม่ได้รัน", value=True, key="show_pending_items"):
+                    pending_df = df_positive_rows[["registration", "company_name", "date", "description", "amount", "transfer_type", "work_category"]].copy()
+                    st.dataframe(pending_df, use_container_width=True, height=400)
 
         all_possible_statuses = ["มีข้อมูล", "ไม่มีข้อมูล", "ค่าว่าง", "ข้อผิดพลาด"]
         available_step2_statuses = sorted(

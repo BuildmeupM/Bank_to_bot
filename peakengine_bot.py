@@ -923,11 +923,14 @@ class PeakEngineBot:
                                     if plus_option_clicked:
                                         if not_found and reg_info:
                                             await self._fill_contact_from_excel(value, reg_info, log)
+                                            await asyncio.sleep(0.5)
                                             validation = await self._compare_contact_fields(reg_info, log)
+                                            await asyncio.sleep(0.5)
                                             if validation:
                                                 results.setdefault("validation", []).append(validation)
                                                 if validation.get("overall_match"):
                                                     await self._confirm_create_contact(log)
+                                                    await asyncio.sleep(0.5)
                                                     receipt_record = await self._post_validation_tasks(reg_info, log)
                                                     if receipt_record:
                                                         results["receipt_links"].append(receipt_record)
@@ -936,6 +939,7 @@ class PeakEngineBot:
                                         else:
                                             if success_found and reg_info:
                                                 validation = await self._compare_contact_fields(reg_info, log)
+                                                await asyncio.sleep(0.5)
                                                 if validation:
                                                     results.setdefault("validation", []).append(validation)
                                                     if validation.get("overall_match"):
@@ -1504,6 +1508,7 @@ class PeakEngineBot:
             return
         if desired_date:
             await self._fill_document_date(desired_date, log)
+            await asyncio.sleep(0.5)
         else:
             log("ℹ️ ไม่มีข้อมูลวันที่จาก Excel สำหรับกรอก", "info")
         row_data.setdefault("registration", info.get("registration"))
@@ -1512,13 +1517,18 @@ class PeakEngineBot:
         row_data.setdefault("amount", info.get("amount"))
         row_data.setdefault("date", info.get("date"))
         await self._fill_tarremark(row_data, log)
+        await asyncio.sleep(0.5)
         await self._fill_product_template(row_data, log)
+        await asyncio.sleep(0.5)
         category_ok = await self._apply_tax_settings(row_data, log)
+        await asyncio.sleep(0.5)
         if category_ok is False:
             log("ℹ️ ข้ามรายการนี้เนื่องจากประเภทการทำงานอยู่ในรายการข้าม", "info")
             return None
         await self._select_bank_account(row_data, log)
+        await asyncio.sleep(0.5)
         await self._fill_payment_allocation(row_data, log)
+        await asyncio.sleep(0.5)
         await self._submit_receipt(log)
         await asyncio.sleep(1)
         return await self._capture_receipt_document(row_data, log)
@@ -1597,88 +1607,6 @@ class PeakEngineBot:
             else:
                 log(f"⚠️ ไม่พบรายการ '{product_code}' ใน dropdown สินค้า/บริการ", "warning")
                 return
-
-            desired_description = self._normalize_component(
-                row_data.get("product_description")
-                or row_data.get("รายละเอียดสินค้า")
-                or row_data.get("คำอธิบายสำหรับสินค้า")
-                or row_data.get("คำอธิบาย")
-                or row_data.get("description")
-                or row_data.get("work_category")
-                or "ไลฟ์สดสินค้าเทศกาลเจนนี่"
-            )
-            try:
-                description_area = await self.page.wait_for_selector('#iptdescription1', timeout=2000)
-                if description_area:
-                    async def apply_description() -> bool:
-                        target_text = desired_description or ""
-                        for pass_idx in range(2):
-                            await description_area.click()
-                            try:
-                                await description_area.press("Control+A")
-                            except Exception:
-                                try:
-                                    await description_area.press("Meta+A")
-                                except Exception:
-                                    pass
-                            try:
-                                await description_area.press("Backspace")
-                            except Exception:
-                                pass
-                            await description_area.fill(target_text)
-                            try:
-                                await self.page.evaluate(
-                                    """(value) => {
-                                        const el = document.querySelector('#iptdescription1');
-                                        if (el) {
-                                            el.value = value;
-                                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                                        }
-                                    }""",
-                                    target_text
-                                )
-                            except Exception:
-                                pass
-                            await asyncio.sleep(0.5)
-
-                        current_value = ""
-                        try:
-                            current_value = await description_area.input_value()
-                        except Exception:
-                            current_value = await self.page.evaluate(
-                                """() => {
-                                    const el = document.querySelector('#iptdescription1');
-                                    return el ? el.value || '' : '';
-                                }"""
-                            )
-
-                        if current_value.strip() == desired_description:
-                            log(f"✅ ปรับรายละเอียดสินค้าเป็น '{desired_description}'", "success")
-                            return True
-
-                        log("❌ ไม่สามารถตั้งรายละเอียดสินค้าให้ตรงกับค่าที่ต้องการได้", "error")
-                        return False
-
-                    first_apply_success = await apply_description()
-
-                    if first_apply_success:
-                        try:
-                            amount_field = await self.page.wait_for_selector('#iptamount1', timeout=2000)
-                            if amount_field:
-                                await amount_field.click()
-                                await asyncio.sleep(0.1)
-                                log("✅ คลิกช่องจำนวน (#iptamount1) เพื่อแก้ไขค่า", "success")
-                            else:
-                                log("⚠️ ไม่พบช่องจำนวน (#iptamount1)", "warning")
-                        except Exception as amount_error:
-                            log(f"⚠️ ไม่สามารถคลิกช่องจำนวน (#iptamount1): {amount_error}", "warning")
-
-                        await apply_description()
-                else:
-                    log("⚠️ ไม่พบช่องรายละเอียดสินค้า (#iptdescription1)", "warning")
-            except Exception as desc_error:
-                log(f"⚠️ ไม่สามารถปรับรายละเอียดสินค้า: {desc_error}", "warning")
         except Exception as e:
             log(f"⚠️ ไม่สามารถเลือกสินค้า/บริการ: {e}", "warning")
 
@@ -1813,13 +1741,6 @@ class PeakEngineBot:
                     log(f"✅ ตั้งราคาสินค้าเป็น {formatted_price}", "success")
                 else:
                     log("⚠️ ไม่สามารถตั้งราคาสินค้าให้แตกต่างจาก 0 ได้หลังพยายามหลายครั้ง", "warning")
-                try:
-                    description_field = await self.page.wait_for_selector('#iptdescription1', timeout=1000)
-                    if description_field:
-                        await description_field.click()
-                        log("✅ คลิกช่องรายละเอียดสินค้า (#iptdescription1) หลังตั้งราคา", "success")
-                except Exception as desc_click_error:
-                    log(f"⚠️ ไม่สามารถคลิกช่องรายละเอียดสินค้า: {desc_click_error}", "warning")
                 await asyncio.sleep(1.5)
             else:
                 log("⚠️ ไม่พบช่องราคา (#iptprice1)", "warning")
@@ -2174,7 +2095,7 @@ class PeakEngineBot:
             dropdown_trigger = None
             dropdown_selector_used = None
             dropdown_selectors = [
-                '//div[contains(@class,"ui dropdown") and descendant::div[@data-value="1846418"]]',
+                '//div[contains(@class,"ui dropdown") and descendant::div[@data-value="1859315"]]',
                 '#ddltargetaccount',
                 'div#ddltargetaccount',
                 'div[name="ddltargetaccount"]',
@@ -2215,11 +2136,12 @@ class PeakEngineBot:
                     pass
             await asyncio.sleep(0.5)
 
-            target_text = "ธ.กสิกรไทย ออมทรัพย์ - 054-1-28372-2 ได้หมดถ้าสดชื่อ"
+            target_text = "ธ.กสิกรไทย ออมทรัพย์ - 0541283722 ได้หมดถ้าสดชื่น"
             bank_option_selectors = [
-                f'//div[contains(@class,"item") and contains(@data-value,"1846418")]',
+                f'//div[contains(@class,"item") and @data-value="1859315"]',
+                f'//div[contains(@class,"item") and contains(@data-value,"1859315")]',
                 f'//div[contains(@class,"item") and normalize-space()="{target_text}"]',
-                f'//div[contains(@class,"item") and contains(text(),"ธ.กสิกรไทย ออมทรัพย์ - 054-1-28372-2")]'
+                f'//div[contains(@class,"item") and contains(text(),"ธ.กสิกรไทย ออมทรัพย์ - 0541283722")]'
             ]
 
             for selector in bank_option_selectors:
@@ -2229,12 +2151,12 @@ class PeakEngineBot:
                         await option.scroll_into_view_if_needed()
                         await asyncio.sleep(0.2)
                         await option.click()
-                        log("✅ เลือกบัญชีธ.กสิกรไทย 054-1-28372-2", "success")
+                        log("✅ เลือกบัญชีธ.กสิกรไทย 0541283722", "success")
                         break
                 except Exception:
                     continue
             else:
-                log("⚠️ ไม่พบตัวเลือกบัญชีธ.กสิกรไทย 054-1-28372-2 ใน dropdown", "warning")
+                log("⚠️ ไม่พบตัวเลือกบัญชีธ.กสิกรไทย 0541283722 ใน dropdown", "warning")
         except Exception as e:
             log(f"⚠️ ไม่สามารถเลือกบัญชีธนาคาร: {e}", "warning")
 
